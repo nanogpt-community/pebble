@@ -20,7 +20,6 @@ use crossterm::event::{
     KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::style::Stylize;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use platform::{pebble_config_home as resolve_pebble_config_home, write_atomic};
 use plugins::{PluginError, PluginManager, PluginSummary};
@@ -39,6 +38,7 @@ use crate::eval::{
 use crate::eval_runner::run_eval_suite;
 use crate::init::{initialize_repo, initialize_repo_with_pebble_md, render_init_pebble_md};
 use crate::input;
+use crate::interrupt::InterruptGuard;
 use crate::mcp::{
     add_mcp_server_interactive, handle_mcp_action, load_mcp_catalog, print_mcp_status,
     print_mcp_tools, set_mcp_server_enabled, McpCatalog, McpCommand,
@@ -46,12 +46,19 @@ use crate::mcp::{
 use crate::models::{
     context_length_for_model, current_service_or_default, default_model_or,
     infer_service_for_model, load_model_state, max_output_tokens_for_model_or, open_model_picker,
-    open_provider_picker, persist_current_model, persist_provider_for_model,
-    persist_proxy_tool_calls, provider_for_model, proxy_tool_calls_enabled, save_model_state,
-    validate_provider_for_model,
+    open_model_picker_for_service, open_provider_picker, persist_current_model,
+    persist_provider_for_model, persist_proxy_tool_calls, provider_for_model,
+    proxy_tool_calls_enabled, refresh_model_catalog, save_model_state, service_from_selector,
+    validate_provider_for_model, verify_model_service_credentials,
 };
+use crate::provider_auth::{
+    parse_auth_command, parse_login_tokens, parse_logout_command, parse_logout_tokens,
+    prompt_for_auth_service_selection, remove_saved_credentials, run_grok_auth_command,
+    save_credentials, AuthService, CredentialRemovalOutcome,
+};
+#[cfg(test)]
+use crate::provider_auth::{LoginCommand, LogoutCommand};
 use crate::proxy::{build_proxy_system_prompt, parse_proxy_value, ProxyCommand, RuntimeToolSpec};
-use crate::render::{Spinner, TerminalRenderer};
 use crate::report::{report_label, report_section, report_title, truncate_for_summary};
 use crate::runtime_client::{
     effective_reasoning_effort, permission_policy, CliToolExecutor, PebbleRuntimeClient,
@@ -68,7 +75,7 @@ use crate::trace_view::{
     load_turn_trace, render_replay_report, render_trace_report, replay_json_report,
     trace_json_report,
 };
-use crate::ui;
+use crate::ui::{self, Stylize};
 use commands::{
     command_names_and_aliases, handle_agents_slash_command, handle_branch_slash_command,
     handle_skills_slash_command, handle_worktree_slash_command, render_help_topics_overview,
@@ -78,17 +85,21 @@ use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
     apply_patch, auto_compaction_threshold_from_env, get_compact_continuation_message,
     get_tool_result_context_output, load_system_prompt_with_model_family, resolve_sandbox_status,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, MessageRole, PermissionMode, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuntimeError, RuntimeJsonValue, RuntimeRetentionConfig, Session,
-    SessionTurnSnapshot, TokenUsage, TurnSummary, UsageTracker,
+    CancellationToken, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
+    RuntimeJsonValue, RuntimeRetentionConfig, Session, SessionTurnSnapshot, TokenUsage,
+    TurnSummary, UsageTracker,
 };
 use tools::{build_plugin_manager, current_tool_registry, GlobalToolRegistry};
 
 pub(crate) const DEFAULT_MODEL: &str = "zai-org/glm-5.1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const INIT_PEBBLE_MD_MAX_TOKENS: u32 = 2_048;
-const DEFAULT_DATE: &str = "2026-03-31";
+const BUILD_DATE: &str = match option_env!("PEBBLE_BUILD_DATE") {
+    Some(date) => date,
+    None => "unknown",
+};
 const SECRET_PROMPT_STALE_ENTER_WINDOW: Duration = Duration::from_millis(150);
 const OPENAI_CODEX_DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const OPENAI_CODEX_DEVICE_POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
@@ -115,6 +126,13 @@ const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
     "checksums.sha256",
 ];
 
+fn current_date() -> String {
+    time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .date()
+        .to_string()
+}
+
 pub(crate) type AllowedToolSet = BTreeSet<String>;
 
 #[allow(clippy::too_many_lines)]
@@ -126,6 +144,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Model { model } => handle_model_action(model)?,
         CliAction::Provider { provider } => handle_provider_action(provider)?,
+        CliAction::Route { route } => handle_route_action(route)?,
         CliAction::Proxy { mode } => handle_proxy_action(mode)?,
         CliAction::Mcp { action } => handle_mcp_action(action)?,
         CliAction::Config {
@@ -136,7 +155,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 handle_plugins_command(action.as_deref(), target.as_deref())?
-            )
+            );
         }
         CliAction::Branch { action, target } => println!(
             "{}",
@@ -277,6 +296,9 @@ enum CliAction {
     Provider {
         provider: Option<String>,
     },
+    Route {
+        route: Option<String>,
+    },
     Proxy {
         mode: ProxyCommand,
     },
@@ -410,6 +432,7 @@ impl CliOutputFormat {
 enum DoctorCommand {
     Check,
     Bundle,
+    Providers { json: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,67 +485,6 @@ impl FastMode {
         match self {
             Self::Off => "off",
             Self::On => "on",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthService {
-    NanoGpt,
-    Synthetic,
-    OpenAiCodex,
-    OpencodeGo,
-    Exa,
-}
-
-impl AuthService {
-    const fn display_name(self) -> &'static str {
-        match self {
-            Self::NanoGpt => "NanoGPT",
-            Self::Synthetic => "Synthetic",
-            Self::OpenAiCodex => "OpenAI Codex",
-            Self::OpencodeGo => "OpenCode Go",
-            Self::Exa => "Exa",
-        }
-    }
-
-    const fn slug(self) -> &'static str {
-        match self {
-            Self::NanoGpt => "nanogpt",
-            Self::Synthetic => "synthetic",
-            Self::OpenAiCodex => "openai-codex",
-            Self::OpencodeGo => "opencode-go",
-            Self::Exa => "exa",
-        }
-    }
-
-    const fn credential_key(self) -> &'static str {
-        match self {
-            Self::NanoGpt => "nanogpt_api_key",
-            Self::Synthetic => "synthetic_api_key",
-            Self::OpenAiCodex => "openai_codex_auth",
-            Self::OpencodeGo => "opencode_go_api_key",
-            Self::Exa => "exa_api_key",
-        }
-    }
-
-    const fn all() -> &'static [AuthService] {
-        &[
-            Self::NanoGpt,
-            Self::Synthetic,
-            Self::OpenAiCodex,
-            Self::OpencodeGo,
-            Self::Exa,
-        ]
-    }
-
-    const fn runtime_service(self) -> Option<ApiService> {
-        match self {
-            Self::NanoGpt => Some(ApiService::NanoGpt),
-            Self::Synthetic => Some(ApiService::Synthetic),
-            Self::OpenAiCodex => Some(ApiService::OpenAiCodex),
-            Self::OpencodeGo => Some(ApiService::OpencodeGo),
-            Self::Exa => None,
         }
     }
 }
@@ -677,6 +639,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
+            flag @ ("--help" | "-h" | "--version" | "-V" | "--resume") => {
+                rest.push(flag.to_string());
+                index += 1;
+            }
+            flag if flag.starts_with('-') && rest.is_empty() => {
+                return Err(format!("unknown option: {flag}"));
+            }
             other => {
                 rest.push(other.to_string());
                 index += 1;
@@ -714,6 +683,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "logout" => parse_logout_args(&rest[1..]),
         "model" | "models" => parse_model_args(&rest[1..]),
         "provider" | "providers" => parse_provider_args(&rest[1..]),
+        "route" | "routing" => parse_route_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
         "mcp" => parse_mcp_args(&rest[1..]),
         "config" => parse_config_args(&rest[1..], output_format),
@@ -741,7 +711,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
         }),
         "init" => Ok(CliAction::Init),
-        "doctor" => parse_doctor_args(&rest[1..]),
+        "doctor" => parse_doctor_args(&rest[1..], output_format),
         "ci" => parse_ci_args(&rest[1..], output_format),
         "release" => parse_release_args(&rest[1..], output_format),
         "self-update" => Ok(CliAction::SelfUpdate),
@@ -801,7 +771,7 @@ fn parse_gc_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::Gc { dry_run })
 }
 
-fn parse_doctor_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_doctor_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Doctor {
             command: DoctorCommand::Check,
@@ -809,8 +779,16 @@ fn parse_doctor_args(args: &[String]) -> Result<CliAction, String> {
         [value] if value == "bundle" => Ok(CliAction::Doctor {
             command: DoctorCommand::Bundle,
         }),
+        [value] if value == "providers" => Ok(CliAction::Doctor {
+            command: DoctorCommand::Providers {
+                json: output_format == CliOutputFormat::Json,
+            },
+        }),
+        [value, flag] if value == "providers" && flag == "--json" => Ok(CliAction::Doctor {
+            command: DoctorCommand::Providers { json: true },
+        }),
         [value] => Err(format!("doctor: unsupported argument `{value}`")),
-        _ => Err("doctor accepts at most one argument: bundle".to_string()),
+        _ => Err("usage: pebble doctor [bundle | providers [--json]]".to_string()),
     }
 }
 
@@ -1093,7 +1071,7 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = current_date();
     let mut index = 0;
 
     while index < args.len() {
@@ -1130,15 +1108,25 @@ fn parse_model_args(args: &[String]) -> Result<CliAction, String> {
 
 fn parse_provider_args(args: &[String]) -> Result<CliAction, String> {
     if args.len() > 1 {
-        return Err("provider accepts at most one optional provider id".to_string());
+        return Err("provider accepts at most one optional provider name".to_string());
     }
     Ok(CliAction::Provider {
         provider: args.first().cloned(),
     })
 }
 
+fn parse_route_args(args: &[String]) -> Result<CliAction, String> {
+    if args.len() > 1 {
+        return Err("route accepts at most one optional NanoGPT route id".to_string());
+    }
+    Ok(CliAction::Route {
+        route: args.first().cloned(),
+    })
+}
+
 fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
-    let parsed = parse_login_tokens(args.iter().map(String::as_str).collect())?;
+    let tokens = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let parsed = parse_login_tokens(&tokens)?;
     Ok(CliAction::Login {
         service: parsed.service,
         api_key: parsed.api_key,
@@ -1146,125 +1134,11 @@ fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_logout_args(args: &[String]) -> Result<CliAction, String> {
-    let parsed = parse_logout_tokens(args.iter().map(String::as_str).collect())?;
+    let tokens = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let parsed = parse_logout_tokens(&tokens)?;
     Ok(CliAction::Logout {
         service: parsed.service,
     })
-}
-
-fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
-    let mut service = None;
-    let mut api_key = None;
-    let mut index = 0;
-
-    while index < tokens.len() {
-        match tokens[index] {
-            "--service" => {
-                let value = tokens
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --service".to_string())?;
-                service = Some(parse_login_service(value)?);
-                index += 2;
-            }
-            flag if flag.starts_with("--service=") => {
-                service = Some(parse_login_service(&flag[10..])?);
-                index += 1;
-            }
-            "--api-key" => {
-                let value = tokens
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --api-key".to_string())?;
-                api_key = Some((*value).to_string());
-                index += 2;
-            }
-            flag if flag.starts_with("--api-key=") => {
-                api_key = Some(flag[10..].to_string());
-                index += 1;
-            }
-            value
-                if matches!(
-                    value,
-                    "nanogpt"
-                        | "nano-gpt"
-                        | "nano"
-                        | "synthetic"
-                        | "synthetic.new"
-                        | "openai-codex"
-                        | "openai_codex"
-                        | "chatgpt"
-                        | "opencode-go"
-                        | "opencodego"
-                        | "exa"
-                ) && api_key.is_none() =>
-            {
-                service = Some(parse_login_service(value)?);
-                index += 1;
-            }
-            value if api_key.is_none() => {
-                api_key = Some(value.to_string());
-                index += 1;
-            }
-            other => return Err(format!("unexpected login argument: {other}")),
-        }
-    }
-
-    Ok(LoginCommand { service, api_key })
-}
-
-fn parse_login_service(value: &str) -> Result<AuthService, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "nanogpt" | "nano-gpt" | "nano" => Ok(AuthService::NanoGpt),
-        "synthetic" | "synthetic.new" => Ok(AuthService::Synthetic),
-        "openai-codex" | "openai_codex" | "chatgpt" => Ok(AuthService::OpenAiCodex),
-        "opencode-go" | "opencodego" => Ok(AuthService::OpencodeGo),
-        "exa" => Ok(AuthService::Exa),
-        other => Err(format!(
-            "unsupported login service `{other}`; expected nanogpt, synthetic, openai-codex, opencode-go, or exa"
-        )),
-    }
-}
-
-fn parse_logout_tokens(tokens: Vec<&str>) -> Result<LogoutCommand, String> {
-    let mut service = None;
-    let mut index = 0;
-
-    while index < tokens.len() {
-        match tokens[index] {
-            "--service" => {
-                let value = tokens
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --service".to_string())?;
-                service = Some(parse_login_service(value)?);
-                index += 2;
-            }
-            flag if flag.starts_with("--service=") => {
-                service = Some(parse_login_service(&flag[10..])?);
-                index += 1;
-            }
-            value
-                if matches!(
-                    value,
-                    "nanogpt"
-                        | "nano-gpt"
-                        | "nano"
-                        | "synthetic"
-                        | "synthetic.new"
-                        | "openai-codex"
-                        | "openai_codex"
-                        | "chatgpt"
-                        | "opencode-go"
-                        | "opencodego"
-                        | "exa"
-                ) =>
-            {
-                service = Some(parse_login_service(value)?);
-                index += 1;
-            }
-            other => return Err(format!("unexpected logout argument: {other}")),
-        }
-    }
-
-    Ok(LogoutCommand { service })
 }
 
 fn parse_proxy_args(args: &[String]) -> Result<CliAction, String> {
@@ -1857,37 +1731,6 @@ fn fuzzy_session_match(haystack: &str, query: &str) -> bool {
     false
 }
 
-fn prompt_for_auth_service_selection() -> Result<Option<AuthService>, Box<dyn std::error::Error>> {
-    println!("Auth services");
-    for (index, service) in AuthService::all().iter().enumerate() {
-        println!(
-            "  {:>2}. {} ({})",
-            index + 1,
-            service.display_name(),
-            service.slug()
-        );
-    }
-    println!();
-    print!(
-        "Select a service [1-{}] or press Enter to cancel: ",
-        AuthService::all().len()
-    );
-    io::stdout().flush()?;
-    let mut buffer = String::new();
-    io::stdin().read_line(&mut buffer)?;
-    let selection = buffer.trim();
-    if selection.is_empty() {
-        return Ok(None);
-    }
-    let index = selection
-        .parse::<usize>()
-        .map_err(|_| format!("invalid selection: {selection}"))?;
-    let Some(service) = AuthService::all().get(index.saturating_sub(1)) else {
-        return Err(format!("selection out of range: {selection}").into());
-    };
-    Ok(Some(*service))
-}
-
 fn login(
     service: Option<AuthService>,
     api_key: Option<String>,
@@ -1899,6 +1742,16 @@ fn login(
             None => return Ok(()),
         },
     };
+    if service == AuthService::Grok {
+        if api_key.is_some() {
+            return Err(
+                "Grok login uses the official CLI OAuth flow and does not accept API keys".into(),
+            );
+        }
+        run_grok_auth_command("login")?;
+        println!("Grok OAuth login complete. Subscription access remains managed by the official Grok CLI.");
+        return Ok(());
+    }
     if service == AuthService::OpenAiCodex {
         if api_key.is_some() {
             return Err(
@@ -1918,12 +1771,55 @@ fn login(
         return Ok(());
     }
     let api_key = resolve_auth_api_key(service, api_key)?;
+    let verification = service.runtime_service().and_then(|runtime_service| {
+        matches!(
+            runtime_service,
+            ApiService::NanoGpt | ApiService::Neuralwatt | ApiService::Lilac
+        )
+        .then(|| verify_model_service_credentials(runtime_service, &api_key))
+    });
+    if let Some(Err(ApiError::Api {
+        status, message, ..
+    })) = &verification
+    {
+        if matches!(
+            *status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(format!(
+                "{} rejected this API key{}; credentials were not saved",
+                service.display_name(),
+                message
+                    .as_deref()
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            )
+            .into());
+        }
+    }
     let credentials_path = save_credentials(service, &api_key)?;
     println!(
         "Saved {} credentials to {}",
         service.display_name(),
         credentials_path.display()
     );
+    match verification {
+        Some(Ok(model_count)) => {
+            println!(
+                "Verified {} with {} available models.",
+                service.display_name(),
+                model_count
+            );
+            if let Some(runtime_service) = service.runtime_service() {
+                let _ = refresh_model_catalog(runtime_service);
+            }
+        }
+        Some(Err(error)) => println!(
+            "Saved, but {} could not be verified: {error}",
+            service.display_name()
+        ),
+        None => {}
+    }
     if let Some(note) = login_model_guidance(service) {
         println!("{note}");
     }
@@ -1951,6 +1847,11 @@ fn login_model_guidance(service: AuthService) -> Option<String> {
         AuthService::NanoGpt => {
             "Run `/model zai-org/glm-5.1` or another NanoGPT-backed model if you want to use this key immediately."
         }
+        AuthService::Neuralwatt => {
+            "Run `/model` and choose a model under the Neuralwatt provider."
+        }
+        AuthService::Lilac => "Run `/model` and choose a model under the Lilac provider.",
+        AuthService::Grok => "Run `/model` and choose Grok 4.5 under the Grok provider.",
         AuthService::Exa => return None,
     };
 
@@ -1969,6 +1870,12 @@ fn logout(service: Option<AuthService>) -> Result<(), Box<dyn std::error::Error>
             None => return Ok(()),
         },
     };
+
+    if service == AuthService::Grok {
+        run_grok_auth_command("logout")?;
+        println!("Grok OAuth session removed by the official Grok CLI.");
+        return Ok(());
+    }
 
     let outcome = remove_saved_credentials(service)?;
     match outcome {
@@ -2047,11 +1954,9 @@ fn login_openai_codex_device_code() -> Result<PathBuf, Box<dyn std::error::Error
         let status = response.status();
         if !matches!(status.as_u16(), 403 | 404) {
             let body = response.text().unwrap_or_default();
-            return Err(format!(
-                "device code authorization failed with status {}: {}",
-                status, body
-            )
-            .into());
+            return Err(
+                format!("device code authorization failed with status {status}: {body}").into(),
+            );
         }
 
         if std::time::Instant::now() >= deadline {
@@ -2185,10 +2090,42 @@ fn handle_model_action(model: Option<String>) -> Result<(), Box<dyn std::error::
 }
 
 fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let service = provider
+        .as_deref()
+        .map(|provider| {
+            service_from_selector(provider).ok_or_else(|| unknown_provider_message(provider))
+        })
+        .transpose()?;
+    match open_model_picker_for_service(service)?.selected_model {
+        Some(model) => println!(
+            "{}",
+            ui::setting_changed(
+                "model provider",
+                &[
+                    ("provider", infer_service_for_model(&model).display_name()),
+                    ("model", &model),
+                ],
+            )
+        ),
+        None => println!(
+            "{}",
+            ui::setting_changed("model provider", &[("result", "selection cancelled")])
+        ),
+    }
+    Ok(())
+}
+
+fn unknown_provider_message(provider: &str) -> String {
+    format!(
+        "unknown model provider `{provider}`; choose nanogpt, neuralwatt, lilac, grok, synthetic, openai-codex, or opencode-go"
+    )
+}
+
+fn handle_route_action(provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let model = default_model_or(DEFAULT_MODEL);
     if infer_service_for_model(&model) != ApiService::NanoGpt {
         return Err(format!(
-            "provider overrides are only available for NanoGPT models; current model {} is on {}",
+            "routing overrides are only available for NanoGPT models; current model {} is on {}. Use `pebble provider` to switch model providers",
             model,
             infer_service_for_model(&model).display_name()
         )
@@ -2200,8 +2137,8 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
             println!(
                 "{}",
                 ui::setting_changed(
-                    "provider",
-                    &[("model", &model), ("provider", "platform default")],
+                    "NanoGPT route",
+                    &[("model", &model), ("route", "platform default")],
                 )
             );
         }
@@ -2211,10 +2148,10 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
             println!(
                 "{}",
                 ui::setting_changed(
-                    "provider",
+                    "NanoGPT route",
                     &[
                         ("model", &model),
-                        ("provider", &provider),
+                        ("route", &provider),
                         ("routing", "paygo routing enabled"),
                     ],
                 )
@@ -2225,20 +2162,20 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
                 println!(
                     "{}",
                     ui::setting_changed(
-                        "provider",
+                        "NanoGPT route",
                         &[
                             ("model", &model),
-                            ("provider", &provider),
+                            ("route", &provider),
                             ("routing", "paygo routing enabled"),
                         ],
                     )
-                )
+                );
             }
             None => println!(
                 "{}",
                 ui::setting_changed(
-                    "provider",
-                    &[("model", &model), ("provider", "platform default")],
+                    "NanoGPT route",
+                    &[("model", &model), ("route", "platform default")],
                 )
             ),
         },
@@ -2248,7 +2185,14 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
 
 fn provider_label_for_service_model(service: ApiService, model: &str) -> Option<String> {
     (service == ApiService::NanoGpt)
-        .then(|| provider_for_model(model).unwrap_or_else(|| "<platform default>".to_string()))
+        .then(|| provider_for_model(model))
+        .flatten()
+}
+
+fn startup_auth_hint(service: ApiService) -> Option<String> {
+    model_auth_status(service)
+        .starts_with("missing")
+        .then(|| format!("/login {}", service.as_str().replace('_', "-")))
 }
 
 fn handle_proxy_action(mode: ProxyCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -2282,11 +2226,8 @@ fn resolve_auth_api_key(
     service: AuthService,
     api_key: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if service == AuthService::OpenAiCodex {
-        return Err(
-            "OpenAI Codex login uses device-code authentication and does not accept API keys"
-                .into(),
-        );
+    if matches!(service, AuthService::OpenAiCodex | AuthService::Grok) {
+        return Err(format!("{} login does not accept API keys", service.display_name()).into());
     }
     match api_key {
         Some(api_key) if !api_key.trim().is_empty() => Ok(api_key),
@@ -2301,112 +2242,9 @@ fn resolve_auth_api_key(
     }
 }
 
-fn save_credentials(
-    service: AuthService,
-    api_key: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let config_home = pebble_config_home()?;
-    fs::create_dir_all(&config_home)?;
-    let credentials_path = config_home.join("credentials.json");
-    let mut parsed = match fs::read_to_string(&credentials_path) {
-        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
-            .unwrap_or_else(|_| serde_json::json!({})),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(Box::new(error)),
-    };
-    if !parsed.is_object() {
-        parsed = serde_json::json!({});
-    }
-    let key_name = service.credential_key();
-    parsed[key_name] = serde_json::Value::String(api_key.to_string());
-    write_atomic(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(credentials_path)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CredentialRemovalOutcome {
-    Removed { path: PathBuf },
-    Missing { path: PathBuf },
-}
-
-fn remove_saved_credentials(
-    service: AuthService,
-) -> Result<CredentialRemovalOutcome, Box<dyn std::error::Error>> {
-    let credentials_path = pebble_config_home()?.join("credentials.json");
-    let contents = match fs::read_to_string(&credentials_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(CredentialRemovalOutcome::Missing {
-                path: credentials_path,
-            });
-        }
-        Err(error) => return Err(Box::new(error)),
-    };
-
-    let mut parsed = serde_json::from_str::<serde_json::Value>(&contents)
-        .unwrap_or_else(|_| serde_json::json!({}));
-    if !parsed.is_object() {
-        parsed = serde_json::json!({});
-    }
-
-    let removed = parsed
-        .as_object_mut()
-        .is_some_and(|object| object.remove(service.credential_key()).is_some());
-    if !removed {
-        return Ok(CredentialRemovalOutcome::Missing {
-            path: credentials_path,
-        });
-    }
-
-    write_atomic(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok(CredentialRemovalOutcome::Removed {
-        path: credentials_path,
-    })
-}
-
 fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
     resolve_pebble_config_home()
         .ok_or_else(|| "could not resolve PEBBLE_CONFIG_HOME, HOME, or USERPROFILE".into())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LoginCommand {
-    service: Option<AuthService>,
-    api_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LogoutCommand {
-    service: Option<AuthService>,
-}
-
-fn parse_auth_command(input: &str) -> Option<LoginCommand> {
-    let mut parts = input.split_whitespace();
-    let command = parts.next()?;
-    if command != "/login" && command != "/auth" {
-        return None;
-    }
-    parse_login_tokens(parts.collect::<Vec<_>>()).ok()
-}
-
-fn parse_logout_command(input: &str) -> Option<LogoutCommand> {
-    let mut parts = input.split_whitespace();
-    let command = parts.next()?;
-    if command != "/logout" {
-        return None;
-    }
-    parse_logout_tokens(parts.collect::<Vec<_>>()).ok()
 }
 
 fn parse_model_command(input: &str) -> Option<Option<String>> {
@@ -2428,6 +2266,21 @@ fn parse_provider_command(input: &str) -> Option<Option<String>> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
     if command != "/provider" && command != "/providers" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    if remainder.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(remainder))
+    }
+}
+
+fn parse_route_command(input: &str) -> Option<Option<String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/route" && command != "/routing" {
         return None;
     }
 
@@ -2825,16 +2678,12 @@ struct StatusUsage {
 }
 
 fn session_undo_redo_counts(session: &Session) -> (usize, usize) {
-    session
-        .metadata
-        .as_ref()
-        .map(|metadata| {
-            (
-                metadata.undo_stack.as_ref().map_or(0, Vec::len),
-                metadata.redo_stack.as_ref().map_or(0, Vec::len),
-            )
-        })
-        .unwrap_or((0, 0))
+    session.metadata.as_ref().map_or((0, 0), |metadata| {
+        (
+            metadata.undo_stack.as_ref().map_or(0, Vec::len),
+            metadata.redo_stack.as_ref().map_or(0, Vec::len),
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2851,7 +2700,7 @@ fn status_context(
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
-    let project_context = runtime::ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = runtime::ProjectContext::discover_with_git(&cwd, current_date())?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     Ok(StatusContext {
@@ -2898,10 +2747,6 @@ fn config_source_label(source: ConfigSource) -> &'static str {
     }
 }
 
-fn report_value(text: impl std::fmt::Display) -> String {
-    text.to_string()
-}
-
 fn format_status_context_window(context_window: Option<ui::ContextWindowInfo>) -> String {
     context_window.map_or_else(|| "unknown".to_string(), ui::format_context_window_usage)
 }
@@ -2919,100 +2764,166 @@ fn format_status_report(
     mcp_catalog: &McpCatalog,
     context: &StatusContext,
 ) -> String {
-    let provider_line = provider
-        .map(|provider| {
-            format!(
-                "\n    {} {}",
-                report_label("provider"),
-                report_value(provider)
-            )
-        })
-        .unwrap_or_default();
-    [
-        format!(
-            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
-            report_title("Pebble Status"),
-            report_section("Session"),
-            report_label("service"),
-            report_value(service.display_name()),
-            report_label("model"),
-            report_value(model),
-            provider_line,
-            report_label("permission_mode"),
-            report_value(permission_mode),
-            report_label("proxy_tools"),
-            if proxy_tool_calls { "enabled" } else { "disabled" },
-            report_label("mode"),
-            collaboration_mode.as_str(),
-            report_label("reasoning"),
-            reasoning_effort_label(reasoning_effort),
-            report_label("fast_mode"),
-            fast_mode.as_str(),
-            report_label("messages"),
-            usage.message_count,
-            report_label("turns"),
-            usage.turns,
-            report_label("undo_available"),
-            usage.undo_count,
-            report_label("redo_available"),
-            usage.redo_count,
-            report_label("estimated_tokens"),
-            usage.estimated_tokens,
-            report_label("context_window"),
-            format_status_context_window(usage.context_window),
-        ),
-        format!(
-            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
-            report_section("Usage"),
-            report_label("latest_total"),
-            usage.latest.total_tokens(),
-            report_label("cumulative_input"),
-            usage.cumulative.input_tokens,
-            report_label("cumulative_output"),
-            usage.cumulative.output_tokens,
-            report_label("cumulative_total"),
-            usage.cumulative.total_tokens(),
-        ),
-        format!(
-            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} loaded {}/{}\n    {} {}\n    {} {}\n    {} servers={} tools={}",
-            report_section("Workspace"),
-            report_label("cwd"),
-            context.cwd.display(),
-            report_label("project_root"),
-            context
-                .project_root
-                .as_ref()
-                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
-            report_label("git_branch"),
-            context.git_branch.as_deref().unwrap_or("unknown"),
-            report_label("session"),
-            context.session_path.as_ref().map_or_else(
-                || "live-repl".to_string(),
-                |path| path.display().to_string()
-            ),
-            report_label("config_files"),
-            context.loaded_config_files,
-            context.discovered_config_files,
-            report_label("instruction_files"),
+    let backend = provider.map_or_else(
+        || service.display_name().to_string(),
+        |provider| format!("{} via {provider}", service.display_name()),
+    );
+    let permission = match permission_mode {
+        "read-only" => "read only",
+        "workspace-write" => "workspace",
+        "danger-full-access" => "full access",
+        other => other,
+    };
+    let mut flags = vec![
+        collaboration_mode.as_str().to_string(),
+        permission.to_string(),
+        format!("think {}", reasoning_effort_label(reasoning_effort)),
+    ];
+    if fast_mode.enabled() {
+        flags.push("fast".to_string());
+    }
+    if proxy_tool_calls {
+        flags.push("proxy tools".to_string());
+    }
+
+    let project = context
+        .project_root
+        .as_deref()
+        .unwrap_or(&context.cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let branch = context.git_branch.as_deref().unwrap_or("no git branch");
+    let sandbox = summary_field(&context.sandbox_summary, "Status").unwrap_or("unknown");
+    let web_service = summary_field(&context.web_tools_summary, "service").unwrap_or("disabled");
+    let web_search = summary_field(&context.web_tools_summary, "web_search")
+        .is_some_and(|value| value == "available");
+
+    let mut output = String::new();
+    let _ = writeln!(output, "{}", report_title("Pebble status"));
+    let _ = writeln!(
+        output,
+        "  {} on {}\n  {}",
+        short_model_name(model),
+        backend,
+        flags.join(" · ")
+    );
+    let turn_count = format!(
+        "{} {}",
+        usage.turns,
+        if usage.turns == 1 { "turn" } else { "turns" }
+    );
+    let _ = writeln!(
+        output,
+        "  {} · {} · {}",
+        turn_count,
+        counted(usage.message_count, "message", "messages"),
+        format_status_context_window(usage.context_window)
+    );
+
+    let _ = writeln!(output, "\n{}", report_section("Workspace"));
+    let _ = writeln!(output, "  {project} on {branch}");
+    let _ = writeln!(output, "  {}", context.cwd.display());
+    let _ = writeln!(
+        output,
+        "  config {}/{} · {} · {}",
+        context.loaded_config_files,
+        context.discovered_config_files,
+        counted(
             context.instruction_file_count,
-            report_label("memory_files"),
-            context.memory_file_count,
-            report_label("mcp"),
-            mcp_catalog.servers.len(),
-            mcp_catalog.tools.len(),
+            "instruction",
+            "instructions"
         ),
+        counted(context.memory_file_count, "memory", "memories"),
+    );
+
+    let _ = writeln!(output, "\n{}", report_section("Session"));
+    let _ = writeln!(
+        output,
+        "  {} input · {} output tokens · {} latest",
+        usage.cumulative.input_tokens,
+        usage.cumulative.output_tokens,
+        usage.latest.total_tokens(),
+    );
+    let _ = writeln!(
+        output,
+        "  undo {} · redo {} · estimated {} tokens",
+        usage.undo_count, usage.redo_count, usage.estimated_tokens
+    );
+    let _ = writeln!(
+        output,
+        "  session {}",
+        context.session_path.as_ref().map_or_else(
+            || "live".to_string(),
+            |path| path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("saved")
+                .to_string()
+        )
+    );
+
+    let _ = writeln!(output, "\n{}", report_section("Runtime"));
+    let _ = writeln!(output, "  model auth {}", model_auth_status(service));
+    let _ = writeln!(output, "  sandbox {sandbox}");
+    let _ = writeln!(
+        output,
+        "  MCP {} · {}",
+        counted(mcp_catalog.servers.len(), "server", "servers"),
+        counted(mcp_catalog.tools.len(), "tool", "tools")
+    );
+    let _ = write!(
+        output,
+        "  web {web_service}{}",
+        if web_search {
+            " · ready"
+        } else {
+            " · unavailable"
+        }
+    );
+    output
+}
+
+fn model_auth_status(service: ApiService) -> String {
+    if service == ApiService::Grok {
+        let executable = env::var("PEBBLE_GROK_CLI").unwrap_or_else(|_| "grok".to_string());
+        return if command_is_available(&executable) {
+            "official Grok CLI available".to_string()
+        } else {
+            "missing · run /login grok".to_string()
+        };
+    }
+    if resolve_api_key_for(service).is_ok() {
+        "connected".to_string()
+    } else {
         format!(
-            "  {}\n    {}",
-            report_section("Sandbox"),
-            context.sandbox_summary.replace('\n', "\n    ")
-        ),
-        format!(
-            "  {}\n    {}",
-            report_section("Web Tools"),
-            context.web_tools_summary.replace('\n', "\n    ")
-        ),
-    ]
-    .join("\n\n")
+            "missing · run /login {}",
+            service.as_str().replace('_', "-")
+        )
+    }
+}
+
+fn command_is_available(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|directory| directory.join(command).is_file())
+    })
+}
+
+fn summary_field<'a>(summary: &'a str, key: &str) -> Option<&'a str> {
+    summary.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix(key)
+            .map(|value| value.trim_start_matches([' ', '=']).trim())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
 fn run_trace_viewer(
@@ -3928,8 +3839,7 @@ fn handle_plugins_command(
                 &install.plugin_id,
                 plugin
                     .as_ref()
-                    .map(|plugin| plugin.metadata.name.as_str())
-                    .unwrap_or(install.plugin_id.as_str()),
+                    .map_or(install.plugin_id.as_str(), |plugin| plugin.metadata.name.as_str()),
                 &install.version,
                 if plugin.as_ref().is_some_and(|plugin| plugin.enabled) {
                     "enabled"
@@ -4013,7 +3923,7 @@ fn plugins_command_is_mutating(action: Option<&str>) -> bool {
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = runtime::ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = runtime::ProjectContext::discover(&cwd, current_date())?;
     let mut lines = vec![format!(
         "Memory\n  Working directory {}\n  Instruction files {}\n  Memory files      {}",
         cwd.display(),
@@ -4178,7 +4088,7 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String, Box<dyn std::err
 fn render_version_report() -> String {
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Version\n  Version          {VERSION}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Version\n  Version          {VERSION}\n  Target           {target}\n  Build date       {BUILD_DATE}"
     )
 }
 
@@ -4364,31 +4274,26 @@ fn resolve_export_path(
 }
 
 fn render_repl_help() -> String {
-    let intro = ui::panel(
-        "Pebble REPL",
-        &[
-            ui::PanelRow::Line(
-                "An agentic coding shell. Slash-commands control the session; anything else is forwarded to the model."
-                    .to_string(),
-            ),
-            ui::PanelRow::Blank,
-            ui::PanelRow::Section("Tips".to_string()),
-            ui::PanelRow::Line(
-                "• /login and /auth open a service picker when no service is provided".to_string(),
-            ),
-            ui::PanelRow::Line(
-                "• /logout removes saved credentials for a service".to_string(),
-            ),
-            ui::PanelRow::Line(
-                "• supported auth services: nanogpt, synthetic, openai-codex, opencode-go, exa"
-                    .to_string(),
-            ),
-            ui::PanelRow::Line(
-                "• /provider is only available for NanoGPT-backed models".to_string(),
-            ),
-        ],
-    );
-    format!("{intro}\n\n{}", render_slash_command_help())
+    format!(
+        "{}\n\n  {:<18} {}\n  {:<18} {}\n  {:<18} {}\n  {:<18} {}\n  {:<18} {}\n  {:<18} {}\n\n{}\n  {}\n  {}\n  {}",
+        report_title("Pebble help"),
+        "/model",
+        "switch model",
+        "/mode build|plan",
+        "switch mode",
+        "/permissions",
+        "tool access",
+        "/status",
+        "session details",
+        "/diff",
+        "workspace changes",
+        "/undo /redo",
+        "restore last turn",
+        report_section("More help"),
+        "/help commands  full reference",
+        "/help sessions  session workflows",
+        "/help auth      model login",
+    )
 }
 
 fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
@@ -4398,11 +4303,20 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
         candidates.insert(candidate);
     }
 
-    for topic in ["help", "auth", "sessions", "extensions", "web"] {
+    for topic in ["commands", "help", "auth", "sessions", "extensions", "web"] {
         candidates.insert(format!("/help {topic}"));
     }
 
-    for service in ["nanogpt", "synthetic", "openai-codex", "opencode-go", "exa"] {
+    for service in [
+        "nanogpt",
+        "neuralwatt",
+        "lilac",
+        "grok",
+        "synthetic",
+        "openai-codex",
+        "opencode-go",
+        "exa",
+    ] {
         candidates.insert(format!("/login {service}"));
         candidates.insert(format!("/auth {service}"));
         candidates.insert(format!("/logout {service}"));
@@ -4472,10 +4386,22 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
         candidates.insert(format!("/model {model}"));
     }
 
+    for provider in [
+        "nanogpt",
+        "neuralwatt",
+        "lilac",
+        "grok",
+        "synthetic",
+        "openai-codex",
+        "opencode-go",
+    ] {
+        candidates.insert(format!("/provider {provider}"));
+    }
+
     if cli.service == ApiService::NanoGpt {
-        candidates.insert("/provider default".to_string());
+        candidates.insert("/route default".to_string());
         if let Some(provider) = provider_for_model(&cli.model) {
-            candidates.insert(format!("/provider {provider}"));
+            candidates.insert(format!("/route {provider}"));
         }
     }
 
@@ -4743,11 +4669,10 @@ fn run_repl_from_session(
     handle: SessionHandle,
     session: Session,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let model = session
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.model.clone())
-        .unwrap_or_else(|| default_model_or(DEFAULT_MODEL));
+    let model = session.metadata.as_ref().map_or_else(
+        || default_model_or(DEFAULT_MODEL),
+        |metadata| metadata.model.clone(),
+    );
     let mut cli = LiveCli::from_session(
         handle,
         session,
@@ -4763,7 +4688,13 @@ fn run_repl_from_session(
 }
 
 fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
-    let mut editor = input::LineEditor::new(ui::prompt_string(), repl_completion_candidates(cli));
+    let mut editor = input::LineEditor::new(
+        ui::prompt_string(cli.collaboration_mode.as_str()),
+        repl_completion_candidates(cli),
+    );
+    if let Some(config_home) = resolve_pebble_config_home() {
+        editor = editor.with_history_path(config_home.join("repl-history"));
+    }
 
     // Welcome banner: a single bordered panel that tells the user who they
     // are talking to, how the agent is configured, and which keystrokes to
@@ -4772,12 +4703,15 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|path| path.display().to_string());
     let provider_label = provider_label_for_service_model(cli.service, &cli.model);
+    let auth_hint = startup_auth_hint(cli.service);
     let banner = if cli.runtime.session().messages.is_empty() {
         ui::welcome_banner(&ui::BannerInfo {
             version: VERSION,
             service: cli.service.display_name(),
             model: &cli.model,
             provider: provider_label.as_deref(),
+            auth_hint: auth_hint.as_deref(),
+            collaboration_mode: cli.collaboration_mode.as_str(),
             permission_mode: cli.permission_mode.as_str(),
             cwd: cwd_display.as_deref(),
         })
@@ -4794,7 +4728,7 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         editor.set_completions(repl_completion_candidates(cli));
-        editor.set_status_line(Some(cli.prompt_status_line()));
+        editor.set_prompt(ui::prompt_string(cli.collaboration_mode.as_str()));
         let input = match editor.read_line()? {
             input::ReadOutcome::Submit(input) => input,
             input::ReadOutcome::Cancel => continue,
@@ -4809,175 +4743,228 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         editor.push_history(trimmed.to_string());
-        if let Some(login_command) = parse_auth_command(trimmed) {
-            login(login_command.service, login_command.api_key)?;
-            continue;
-        }
-        if let Some(logout_command) = parse_logout_command(trimmed) {
-            logout(logout_command.service)?;
-            continue;
-        }
-        if let Some(model) = parse_model_command(trimmed) {
-            match model {
-                Some(model) => cli.set_model(model)?,
-                None => {
-                    if let Some(model) = open_model_picker()?.selected_model {
-                        cli.set_model(model)?;
-                    }
-                }
+        let command_result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+            if let Some(login_command) = parse_auth_command(trimmed) {
+                login(login_command.service, login_command.api_key)?;
+                return Ok(false);
             }
-            continue;
-        }
-        if let Some(provider) = parse_provider_command(trimmed) {
-            match provider {
-                Some(provider) if is_clear_provider_arg(&provider) => cli.set_provider(None)?,
-                Some(provider) => cli.set_provider(Some(provider))?,
-                None => match open_provider_picker(&cli.model)?.selected_provider {
-                    Some(provider) => cli.set_provider(Some(provider))?,
-                    None => cli.set_provider(None)?,
-                },
+            if let Some(logout_command) = parse_logout_command(trimmed) {
+                logout(logout_command.service)?;
+                return Ok(false);
             }
-            continue;
-        }
-        if let Some(mode) = parse_proxy_command(trimmed) {
-            handle_proxy_runtime_command(cli, mode?)?;
-            continue;
-        }
-        if let Some(reasoning_effort) = parse_reasoning_command(trimmed) {
-            cli.set_reasoning(reasoning_effort?)?;
-            continue;
-        }
-        if let Some(mode) = parse_mode_command(trimmed) {
-            cli.set_mode(mode?)?;
-            continue;
-        }
-        if let Some(fast_mode) = parse_fast_command(trimmed) {
-            cli.set_fast_mode(fast_mode?)?;
-            continue;
-        }
-        if let Some(command) = parse_mcp_command(trimmed) {
-            handle_mcp_runtime_command(cli, command?)?;
-            continue;
-        }
-        if let Some(mode) = parse_permissions_command(trimmed) {
-            cli.set_permissions(mode?)?;
-            continue;
-        }
-        match trimmed {
-            "/exit" | "/quit" => break,
-            _ if trimmed.starts_with('/') => {
-                let Some(command) = SlashCommand::parse(trimmed) else {
-                    continue;
-                };
-                match command {
-                    SlashCommand::Help { topic } => println!(
-                        "{}",
-                        topic.as_deref().map_or_else(render_repl_help, |topic| {
-                            render_slash_command_help_topic(Some(topic))
-                        },)
-                    ),
-                    SlashCommand::Status => cli.print_status(),
-                    SlashCommand::Compact => cli.compact()?,
-                    SlashCommand::Archives { action, target } => println!(
-                        "{}",
-                        render_archived_tool_results_report(
-                            cli.runtime.session(),
-                            Some(&cli.session.path),
-                            action.as_deref(),
-                            target.as_deref(),
-                        )?
-                    ),
-                    SlashCommand::Undo => cli.undo_turn()?,
-                    SlashCommand::Redo => cli.redo_turn()?,
-                    SlashCommand::Timeline => println!("{}", cli.render_timeline()),
-                    SlashCommand::Fork { target } => cli.fork_session(target.as_deref())?,
-                    SlashCommand::Rename { title } => cli.rename_session(title.as_deref())?,
-                    SlashCommand::Reasoning { effort } => {
-                        cli.set_reasoning(match effort.as_deref() {
-                            Some(value) => Some(parse_reasoning_effort_arg(value)?),
-                            None => None,
-                        })?
-                    }
-                    SlashCommand::Fast { enabled } => {
-                        cli.set_fast_mode(enabled.map(|enabled| {
-                            if enabled {
-                                FastMode::On
-                            } else {
-                                FastMode::Off
-                            }
-                        }))?
-                    }
-                    SlashCommand::Mode { mode } => cli.set_mode(
-                        mode.as_deref()
-                            .map(parse_collaboration_mode_arg)
-                            .transpose()?,
-                    )?,
-                    SlashCommand::Permissions { mode } => cli.set_permissions(
-                        mode.as_deref().map(parse_permission_mode_arg).transpose()?,
-                    )?,
-                    SlashCommand::Clear { confirm } => cli.clear_session(confirm)?,
-                    SlashCommand::Resume { session_path } => cli.resume_session(session_path)?,
-                    SlashCommand::Config { section } => {
-                        println!("{}", render_config_report(section.as_deref())?)
-                    }
-                    SlashCommand::Memory => println!("{}", render_memory_report()?),
-                    SlashCommand::Init => run_init_with_model(cli.service, &cli.model)?,
-                    SlashCommand::Diff => println!("{}", render_diff_report()?),
-                    SlashCommand::Patch { args } => cli.run_patch_command(args.as_deref())?,
-                    SlashCommand::Version => print_version(),
-                    SlashCommand::Branch { action, target } => println!(
-                        "{}",
-                        handle_branch_slash_command(
-                            action.as_deref(),
-                            target.as_deref(),
-                            &env::current_dir()?,
-                        )?
-                    ),
-                    SlashCommand::Worktree {
-                        action,
-                        path,
-                        branch,
-                    } => println!(
-                        "{}",
-                        handle_worktree_slash_command(
-                            action.as_deref(),
-                            path.as_deref(),
-                            branch.as_deref(),
-                            &env::current_dir()?,
-                        )?
-                    ),
-                    SlashCommand::Export { path } => cli.export_session(path.as_deref())?,
-                    SlashCommand::Session { action, target } => {
-                        cli.handle_session_command(action.as_deref(), target.as_deref())?
-                    }
-                    SlashCommand::Sessions => println!("{}", render_session_list(&cli.session.id)?),
-                    SlashCommand::Plugins { action, target } => {
-                        cli.handle_plugins_command(action.as_deref(), target.as_deref())?
-                    }
-                    SlashCommand::Agents { args } => println!(
-                        "{}",
-                        handle_agents_slash_command(args.as_deref(), &env::current_dir()?)?
-                    ),
-                    SlashCommand::Skills { args } => println!(
-                        "{}",
-                        handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
-                    ),
-                    SlashCommand::Unknown(name) => {
-                        if !cli.run_custom_slash_command(trimmed)? {
-                            eprintln!("unknown slash command: /{name}");
+            if let Some(model) = parse_model_command(trimmed) {
+                match model {
+                    Some(model) => cli.set_model(model)?,
+                    None => {
+                        if let Some(model) = open_model_picker()?.selected_model {
+                            cli.set_model(model)?;
                         }
                     }
-                    SlashCommand::Model { .. }
-                    | SlashCommand::Logout { .. }
-                    | SlashCommand::Mcp { .. } => {
-                        unreachable!("handled before shared slash command dispatch")
+                }
+                return Ok(false);
+            }
+            if let Some(provider) = parse_provider_command(trimmed) {
+                let service = provider
+                    .as_deref()
+                    .map(|provider| {
+                        service_from_selector(provider)
+                            .ok_or_else(|| unknown_provider_message(provider))
+                    })
+                    .transpose()?;
+                if let Some(model) = open_model_picker_for_service(service)?.selected_model {
+                    cli.set_model(model)?;
+                }
+                return Ok(false);
+            }
+            if let Some(route) = parse_route_command(trimmed) {
+                match route {
+                    Some(route) if is_clear_provider_arg(&route) => cli.set_route(None)?,
+                    Some(route) => cli.set_route(Some(route))?,
+                    None => match open_provider_picker(&cli.model)?.selected_provider {
+                        Some(route) => cli.set_route(Some(route))?,
+                        None => cli.set_route(None)?,
+                    },
+                }
+                return Ok(false);
+            }
+            if let Some(mode) = parse_proxy_command(trimmed) {
+                handle_proxy_runtime_command(cli, mode?)?;
+                return Ok(false);
+            }
+            if let Some(reasoning_effort) = parse_reasoning_command(trimmed) {
+                cli.set_reasoning(reasoning_effort?)?;
+                return Ok(false);
+            }
+            if let Some(mode) = parse_mode_command(trimmed) {
+                cli.set_mode(mode?)?;
+                return Ok(false);
+            }
+            if let Some(fast_mode) = parse_fast_command(trimmed) {
+                cli.set_fast_mode(fast_mode?)?;
+                return Ok(false);
+            }
+            if let Some(command) = parse_mcp_command(trimmed) {
+                handle_mcp_runtime_command(cli, command?)?;
+                return Ok(false);
+            }
+            if let Some(mode) = parse_permissions_command(trimmed) {
+                cli.set_permissions(mode?)?;
+                return Ok(false);
+            }
+            match trimmed {
+                "/exit" | "/quit" => return Ok(true),
+                _ if trimmed.starts_with('/') => {
+                    let Some(command) = SlashCommand::parse(trimmed) else {
+                        return Ok(false);
+                    };
+                    match command {
+                        SlashCommand::Help { topic } => println!(
+                            "{}",
+                            match topic.as_deref() {
+                                None => render_repl_help(),
+                                Some("commands" | "all") => render_slash_command_help(),
+                                Some(topic) => render_slash_command_help_topic(Some(topic)),
+                            }
+                        ),
+                        SlashCommand::Status => cli.print_status(),
+                        SlashCommand::Compact => cli.compact()?,
+                        SlashCommand::Archives { action, target } => println!(
+                            "{}",
+                            render_archived_tool_results_report(
+                                cli.runtime.session(),
+                                Some(&cli.session.path),
+                                action.as_deref(),
+                                target.as_deref(),
+                            )?
+                        ),
+                        SlashCommand::Undo => cli.undo_turn()?,
+                        SlashCommand::Redo => cli.redo_turn()?,
+                        SlashCommand::Timeline => println!("{}", cli.render_timeline()),
+                        SlashCommand::Fork { target } => cli.fork_session(target.as_deref())?,
+                        SlashCommand::Rename { title } => cli.rename_session(title.as_deref())?,
+                        SlashCommand::Reasoning { effort } => {
+                            cli.set_reasoning(match effort.as_deref() {
+                                Some(value) => Some(parse_reasoning_effort_arg(value)?),
+                                None => None,
+                            })?;
+                        }
+                        SlashCommand::Fast { enabled } => {
+                            cli.set_fast_mode(enabled.map(|enabled| {
+                                if enabled {
+                                    FastMode::On
+                                } else {
+                                    FastMode::Off
+                                }
+                            }))?;
+                        }
+                        SlashCommand::Mode { mode } => cli.set_mode(
+                            mode.as_deref()
+                                .map(parse_collaboration_mode_arg)
+                                .transpose()?,
+                        )?,
+                        SlashCommand::Permissions { mode } => cli.set_permissions(
+                            mode.as_deref().map(parse_permission_mode_arg).transpose()?,
+                        )?,
+                        SlashCommand::Clear { confirm } => cli.clear_session(confirm)?,
+                        SlashCommand::Resume { session_path } => {
+                            cli.resume_session(session_path)?;
+                        }
+                        SlashCommand::Config { section } => {
+                            println!("{}", render_config_report(section.as_deref())?);
+                        }
+                        SlashCommand::Memory => println!("{}", render_memory_report()?),
+                        SlashCommand::Init => run_init_with_model(cli.service, &cli.model)?,
+                        SlashCommand::Diff => println!("{}", render_diff_report()?),
+                        SlashCommand::Patch { args } => cli.run_patch_command(args.as_deref())?,
+                        SlashCommand::Version => print_version(),
+                        SlashCommand::Branch { action, target } => println!(
+                            "{}",
+                            handle_branch_slash_command(
+                                action.as_deref(),
+                                target.as_deref(),
+                                &env::current_dir()?,
+                            )?
+                        ),
+                        SlashCommand::Worktree {
+                            action,
+                            path,
+                            branch,
+                        } => println!(
+                            "{}",
+                            handle_worktree_slash_command(
+                                action.as_deref(),
+                                path.as_deref(),
+                                branch.as_deref(),
+                                &env::current_dir()?,
+                            )?
+                        ),
+                        SlashCommand::Export { path } => cli.export_session(path.as_deref())?,
+                        SlashCommand::Session { action, target } => {
+                            cli.handle_session_command(action.as_deref(), target.as_deref())?;
+                        }
+                        SlashCommand::Sessions => {
+                            println!("{}", render_session_list(&cli.session.id)?);
+                        }
+                        SlashCommand::Plugins { action, target } => {
+                            cli.handle_plugins_command(action.as_deref(), target.as_deref())?;
+                        }
+                        SlashCommand::Agents { args } => println!(
+                            "{}",
+                            handle_agents_slash_command(args.as_deref(), &env::current_dir()?)?
+                        ),
+                        SlashCommand::Skills { args } => println!(
+                            "{}",
+                            handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
+                        ),
+                        SlashCommand::Unknown(name) => {
+                            if !cli.run_custom_slash_command(trimmed)? {
+                                eprintln!(
+                                    "{}",
+                                    ui::error_note(&format!(
+                                        "Unknown command /{name}. Type /help for the essentials."
+                                    ))
+                                );
+                            }
+                        }
+                        SlashCommand::Model { .. }
+                        | SlashCommand::Provider { .. }
+                        | SlashCommand::Route { .. }
+                        | SlashCommand::Logout { .. }
+                        | SlashCommand::Mcp { .. } => {
+                            unreachable!("handled before shared slash command dispatch")
+                        }
+                    }
+                }
+                _ => {
+                    if let Err(error) = cli.run_turn(trimmed) {
+                        if error
+                            .downcast_ref::<RuntimeError>()
+                            .is_some_and(RuntimeError::is_cancelled)
+                        {
+                            println!();
+                            println!("{}", ui::dim_note("Cancelled."));
+                        } else {
+                            eprintln!("{}", ui::error_note(&format!("Request failed: {error}")));
+                        }
                     }
                 }
             }
-            _ => cli.run_turn(trimmed)?,
+            Ok(false)
+        })();
+        match command_result {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => eprintln!("{}", ui::error_note(&error.to_string())),
         }
     }
 
+    println!(
+        "{}",
+        ui::dim_note(&format!(
+            "Saved {}.\n  Use /resume to return.",
+            cli.session.id
+        ))
+    );
     Ok(())
 }
 
@@ -5123,30 +5110,36 @@ impl LiveCli {
         }
     }
 
+    fn run_runtime_turn(
+        &mut self,
+        input: &str,
+        prompter: &mut dyn PermissionPrompter,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let cancellation = CancellationToken::new();
+        let _interrupt = InterruptGuard::install(&cancellation)?;
+        self.runtime
+            .run_turn_cancellable(input, Some(prompter), &cancellation)
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let before_message_count = self.runtime.session().messages.len();
+        let before_session = self.runtime.session().clone();
         let before_files = WorktreeSnapshot::capture(&cwd);
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        // Visual turn separator so the transcript has clear "acts": one per
-        // user message. Muted colour so it never steals attention from the
-        // actual content above or below.
-        println!("{}", ui::turn_separator());
-        spinner.tick(
-            if self.collaboration_mode == CollaborationMode::Plan {
-                "planning"
+        println!();
+        println!(
+            "{}",
+            ui::activity_note(if self.collaboration_mode == CollaborationMode::Plan {
+                "Planning..."
             } else {
-                "thinking"
-            },
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+                "Working..."
+            })
+        );
+        let started_at = Instant::now();
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = self.run_runtime_turn(input, &mut permission_prompter);
         match result {
             Ok(summary) => {
-                spinner.finish("done", TerminalRenderer::new().color_theme(), &mut stdout)?;
                 let mut session = self.runtime.session().clone();
                 let snapshot =
                     build_turn_snapshot(&cwd, &before_files, before_message_count, &session);
@@ -5163,6 +5156,7 @@ impl LiveCli {
                 println!(
                     "{}",
                     ui::turn_summary(&ui::TurnSummaryInfo {
+                        elapsed: started_at.elapsed(),
                         iterations: summary.iterations,
                         tool_calls: collect_tool_uses(&summary).len(),
                         changed_files,
@@ -5182,12 +5176,27 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                spinner.fail(
-                    "request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                Err(Box::new(error))
+                if self.runtime.session().messages.len() <= before_message_count + 1 {
+                    self.runtime.replace_session(before_session);
+                    self.persist_session()?;
+                    return Err(Box::new(error));
+                }
+
+                let mut session = self.runtime.session().clone();
+                if let Some(snapshot) =
+                    build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
+                {
+                    append_undo_snapshot(&mut session, snapshot);
+                    self.runtime.replace_session(session);
+                }
+                self.persist_session()?;
+                if error.is_cancelled() {
+                    return Err(Box::new(error));
+                }
+                Err(
+                    format!("{error}\n  Partial turn saved. Use /undo to revert its file changes.")
+                        .into(),
+                )
             }
         }
     }
@@ -5195,11 +5204,28 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let before_message_count = self.runtime.session().messages.len();
+        let before_session = self.runtime.session().clone();
         let before_files = WorktreeSnapshot::capture(&cwd);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = self
-            .runtime
-            .run_turn(input, Some(&mut permission_prompter))?;
+        let summary = match self.run_runtime_turn(input, &mut permission_prompter) {
+            Ok(summary) => summary,
+            Err(error) => {
+                if self.runtime.session().messages.len() <= before_message_count + 1 {
+                    self.runtime.replace_session(before_session);
+                    self.persist_session()?;
+                } else {
+                    let mut session = self.runtime.session().clone();
+                    if let Some(snapshot) =
+                        build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
+                    {
+                        append_undo_snapshot(&mut session, snapshot);
+                        self.runtime.replace_session(session);
+                    }
+                    self.persist_session()?;
+                }
+                return Err(Box::new(error));
+            }
+        };
         let mut session = self.runtime.session().clone();
         if let Some(snapshot) =
             build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
@@ -5289,32 +5315,6 @@ impl LiveCli {
         Ok(())
     }
 
-    /// Build the one-line status strip rendered above the input prompt.
-    ///
-    /// The REPL calls this before every input read so the strip always
-    /// reflects the agent's current configuration. We deliberately
-    /// compute this fresh each time instead of caching so toggled settings
-    /// (mode, reasoning, permissions, provider) take effect immediately.
-    fn prompt_status_line(&self) -> String {
-        let estimated = self.runtime.estimated_tokens();
-        let estimated_tokens =
-            (estimated > 0).then_some(u64::try_from(estimated).unwrap_or(u64::MAX));
-        let info = ui::PromptStatusInfo {
-            model: short_model_name(&self.model),
-            permission_mode: self.permission_mode.as_str(),
-            collaboration_mode: self.collaboration_mode.as_str(),
-            reasoning_effort: reasoning_effort_label(self.effective_reasoning_effort()),
-            fast_mode: self.fast_mode.enabled(),
-            proxy_tool_calls: self.proxy_tool_calls,
-            estimated_tokens,
-            context_window: estimated_tokens.and_then(|tokens| self.context_window_usage(tokens)),
-        };
-        let cwd = env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string());
-        ui::prompt_status_line_with_cwd(&info, cwd.as_deref())
-    }
-
     fn print_status(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
@@ -5347,15 +5347,6 @@ impl LiveCli {
                 &context,
             )
         );
-        if self.model == DEFAULT_MODEL {
-            println!();
-            println!("  Defaults");
-            println!("    fallback_model   active");
-        } else {
-            println!();
-            println!("  Defaults");
-            println!("    fallback_model   {DEFAULT_MODEL}");
-        }
     }
 
     fn context_window_usage(&self, used_tokens: u64) -> Option<ui::ContextWindowInfo> {
@@ -5386,7 +5377,7 @@ impl LiveCli {
         let service = self.service.display_name().to_string();
         let mut fields = vec![("service", service.as_str()), ("model", model.as_str())];
         if let Some(provider) = provider_label_for_service_model(self.service, &self.model) {
-            fields.push(("provider", provider.as_str()));
+            fields.push(("route", provider.as_str()));
             println!("{}", ui::setting_changed("model", &fields));
         } else {
             println!("{}", ui::setting_changed("model", &fields));
@@ -5394,10 +5385,10 @@ impl LiveCli {
         Ok(())
     }
 
-    fn set_provider(&mut self, provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    fn set_route(&mut self, provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         if self.service != ApiService::NanoGpt {
             return Err(format!(
-                "provider overrides are only supported for NanoGPT models; current model {} is on {}",
+                "routing overrides are only supported for NanoGPT models; current model {} is on {}. Use `/provider` to switch model providers",
                 self.model,
                 self.service.display_name()
             )
@@ -5421,10 +5412,10 @@ impl LiveCli {
         println!(
             "{}",
             ui::setting_changed(
-                "provider",
+                "NanoGPT route",
                 &[
                     ("model", self.model.as_str()),
-                    ("provider", provider_label.as_str()),
+                    ("route", provider_label.as_str()),
                     ("routing", routing),
                 ],
             )
@@ -5982,7 +5973,7 @@ impl LiveCli {
         prompt: String,
         prompter: &mut CliPermissionPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
-        self.runtime.run_turn(prompt, Some(prompter))
+        self.run_runtime_turn(&prompt, prompter)
     }
 
     pub(crate) fn current_session(&self) -> Session {
@@ -6093,11 +6084,15 @@ impl PermissionPrompter for CliPermissionPrompter {
             println!("{preview}");
         } else {
             println!(
-                "  Input            {}",
+                "  {}  {}",
+                "Input".with(ui::palette::MUTED),
                 truncate_for_summary(&request.input, 1_000)
             );
         }
-        print!("{} ", "Approve? [y/N]".to_string().with(ui::palette::WARN));
+        print!(
+            "\n{} ",
+            "Allow once? [y/N]".to_string().with(ui::palette::WARN)
+        );
         let _ = io::stdout().flush();
 
         let mut response = String::new();
@@ -6318,7 +6313,7 @@ fn build_system_prompt(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut prompt = load_system_prompt_with_model_family(
         env::current_dir()?,
-        DEFAULT_DATE,
+        current_date(),
         env::consts::OS,
         "unknown",
         prompt_model_family(service, model),
@@ -6368,6 +6363,9 @@ fn prompt_model_family(service: ApiService, model: &str) -> String {
         ApiService::Synthetic => format!("Synthetic ({model})"),
         ApiService::OpenAiCodex => format!("OpenAI Codex ({model})"),
         ApiService::OpencodeGo => format!("OpenCode Go ({model})"),
+        ApiService::Neuralwatt => format!("Neuralwatt ({model})"),
+        ApiService::Lilac => format!("Lilac ({model})"),
+        ApiService::Grok => format!("Grok subscription ({model})"),
     }
 }
 
@@ -7369,6 +7367,8 @@ fn run_resume_command(
         | SlashCommand::Fork { .. }
         | SlashCommand::Rename { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Provider { .. }
+        | SlashCommand::Route { .. }
         | SlashCommand::Logout { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
@@ -7389,11 +7389,10 @@ fn run_resume_command(
 fn compact_resumed_session(
     session: &Session,
 ) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>> {
-    let fallback_model = session
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.model.clone())
-        .unwrap_or_else(|| default_model_or(DEFAULT_MODEL));
+    let fallback_model = session.metadata.as_ref().map_or_else(
+        || default_model_or(DEFAULT_MODEL),
+        |metadata| metadata.model.clone(),
+    );
     let restored = session_runtime_state(
         session,
         &fallback_model,
@@ -7447,15 +7446,14 @@ fn print_help() {
         "  pebble [--model MODEL] [--permission-mode MODE] [--mode MODE] [--reasoning LEVEL] [--fast] [--allowedTools TOOL[,TOOL...]]"
     );
     println!("                                               Start interactive REPL");
+    println!("  pebble login [SERVICE] [--api-key KEY]    Connect a model or research provider");
     println!(
-        "  pebble login [SERVICE] [--api-key KEY]    Save credentials for NanoGPT, Synthetic, OpenAI Codex, OpenCode Go, or Exa"
-    );
-    println!(
-        "                                               Services: nanogpt, synthetic, openai-codex, opencode-go, exa"
+        "                                               Services: nanogpt, neuralwatt, lilac, grok, synthetic, openai-codex, opencode-go, exa"
     );
     println!("  pebble logout [SERVICE]                   Remove saved credentials for a service");
     println!("  pebble model [MODEL_ID]                   Choose or persist a default model");
-    println!("  pebble provider [PROVIDER_ID|default]     Choose a provider for the active model");
+    println!("  pebble provider [NAME]                   Choose a model provider, then a model");
+    println!("  pebble route [ROUTE_ID|default]          Override NanoGPT's upstream route");
     println!("  pebble proxy [on|off|status]              Toggle XML tool-call proxy mode");
     println!(
         "  pebble mcp [status|tools|reload|add <name>|enable <name>|disable <name>] Inspect configured MCP servers and tools"
@@ -7468,6 +7466,7 @@ fn print_help() {
     println!("  pebble init                               Create starter Pebble project files");
     println!("  pebble doctor                             Run local environment diagnostics");
     println!("  pebble doctor bundle                      Write a redacted diagnostics bundle");
+    println!("  pebble doctor providers [--json]          Probe provider auth and model catalogs");
     println!("  pebble ci check [--json] [--save-report] Run local CI harness safety checks");
     println!("  pebble ci history [--json] [--limit N]   Show saved CI check reports");
     println!("  pebble release check [--json] [--save-report]");
@@ -7601,7 +7600,7 @@ fn init_generation_system_prompt() -> &'static str {
 }
 
 fn build_init_generation_prompt(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let project_context = runtime::ProjectContext::discover_with_git(cwd, DEFAULT_DATE)?;
+    let project_context = runtime::ProjectContext::discover_with_git(cwd, current_date())?;
     let mut prompt = String::new();
     writeln!(
         &mut prompt,
@@ -8439,6 +8438,7 @@ fn run_doctor(command: DoctorCommand) -> Result<(), Box<dyn std::error::Error>> 
     match command {
         DoctorCommand::Check => run_doctor_check(&cwd),
         DoctorCommand::Bundle => run_doctor_bundle(&cwd),
+        DoctorCommand::Providers { json } => crate::provider_diagnostics::run(json),
     }
 }
 

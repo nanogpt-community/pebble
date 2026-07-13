@@ -42,3 +42,50 @@ jobs:
 
       - name: Run harness safety checks
         run: cargo run -p pebble -- ci check
+
+  terminal-smoke:
+    name: terminal smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Build Pebble
+        run: cargo build -p pebble
+
+      - name: Run PTY smoke tests
+        run: python3 scripts/pty_smoke.py
+
+  windows-smoke:
+    name: redirected terminal smoke (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Build Pebble
+        run: cargo build -p pebble
+
+      - name: Run Windows smoke tests
+        shell: pwsh
+        run: ./scripts/windows_smoke.ps1

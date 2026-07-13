@@ -1,15 +1,13 @@
-use crossterm::cursor::MoveToColumn;
-use crossterm::execute;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::style::Color;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
-use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+
+use crate::ui::Stylize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
@@ -23,9 +21,6 @@ pub struct ColorTheme {
     table_border: Color,
     code_block_border: Color,
     rule: Color,
-    spinner_active: Color,
-    spinner_done: Color,
-    spinner_failed: Color,
 }
 
 impl Default for ColorTheme {
@@ -41,172 +36,7 @@ impl Default for ColorTheme {
             table_border: Color::DarkBlue,
             code_block_border: Color::DarkGrey,
             rule: Color::DarkGrey,
-            spinner_active: Color::Cyan,
-            spinner_done: Color::Green,
-            spinner_failed: Color::Red,
         }
-    }
-}
-
-/// A braille-dot spinner used to give a steady "something is happening" cue
-/// during streaming turns. The spinner rewrites the current line in place so
-/// it stays compact even when the agent takes a while to respond.
-///
-/// In addition to the active frame we track two pieces of context that make
-/// the wait feel less opaque:
-///
-/// - the [`Instant`] when the spinner started, so `tick` can display an
-///   elapsed counter,
-/// - an optional *phase* string that callers can set to explain what the
-///   agent is doing right now (`"thinking"`, `"calling Bash"`, ...).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Spinner {
-    frame_index: usize,
-    started_at: Option<Instant>,
-    phase: Option<String>,
-}
-
-impl Spinner {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Attach a descriptive phase (e.g. `"calling Bash"`) that will be shown
-    /// next to the main label until it is explicitly cleared.
-    #[allow(dead_code)]
-    pub fn set_phase(&mut self, phase: Option<String>) {
-        self.phase = phase;
-    }
-
-    fn ensure_started(&mut self) {
-        if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
-        }
-    }
-
-    fn reset(&mut self) {
-        self.frame_index = 0;
-        self.started_at = None;
-        self.phase = None;
-    }
-
-    fn format_elapsed(&self) -> String {
-        let Some(started) = self.started_at else {
-            return String::new();
-        };
-        let elapsed = started.elapsed();
-        // Suppress sub-second noise: showing `(0ms)` right after start makes
-        // the line visually busy without telling the user anything useful.
-        // Once we cross the half-second mark we start displaying duration.
-        if elapsed.as_millis() < 500 {
-            return String::new();
-        }
-        if elapsed.as_secs() >= 60 {
-            let minutes = elapsed.as_secs() / 60;
-            let seconds = elapsed.as_secs() % 60;
-            format!("{minutes}m{seconds:02}s")
-        } else {
-            format!("{}s", elapsed.as_secs().max(1))
-        }
-    }
-
-    /// Draw (or redraw in-place) the spinner line. The label is the primary
-    /// task description; the optional phase and elapsed time are appended in
-    /// subdued styling to keep the line scannable.
-    pub fn tick(
-        &mut self,
-        label: &str,
-        theme: &ColorTheme,
-        out: &mut impl Write,
-    ) -> io::Result<()> {
-        self.ensure_started();
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
-        self.frame_index += 1;
-        let elapsed = self.format_elapsed();
-        let phase_suffix = self
-            .phase
-            .as_ref()
-            .filter(|phase| !phase.is_empty())
-            .map(|phase| format!("{}", format!(" · {phase}").with(Color::DarkGrey)))
-            .unwrap_or_default();
-        let elapsed_suffix = if elapsed.is_empty() {
-            String::new()
-        } else {
-            format!("{}", format!(" ({elapsed})").with(Color::DarkGrey))
-        };
-        execute!(
-            out,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}{phase_suffix}{elapsed_suffix}\n")),
-            ResetColor
-        )?;
-        out.flush()
-    }
-
-    /// Replace the spinner line with a success marker and a final message.
-    pub fn finish(
-        &mut self,
-        label: &str,
-        theme: &ColorTheme,
-        out: &mut impl Write,
-    ) -> io::Result<()> {
-        let elapsed = self.format_elapsed();
-        self.reset();
-        let suffix = if elapsed.is_empty() {
-            String::new()
-        } else {
-            format!("{}", format!(" ({elapsed})").with(Color::DarkGrey))
-        };
-        execute!(
-            out,
-            SetForegroundColor(theme.spinner_done),
-            Print(format!("\n✔ {label}{suffix}\n")),
-            ResetColor
-        )?;
-        out.flush()
-    }
-
-    /// Replace the spinner line with a failure marker and final message.
-    pub fn fail(
-        &mut self,
-        label: &str,
-        theme: &ColorTheme,
-        out: &mut impl Write,
-    ) -> io::Result<()> {
-        let elapsed = self.format_elapsed();
-        self.reset();
-        let suffix = if elapsed.is_empty() {
-            String::new()
-        } else {
-            format!("{}", format!(" ({elapsed})").with(Color::DarkGrey))
-        };
-        execute!(
-            out,
-            SetForegroundColor(theme.spinner_failed),
-            Print(format!("\n✘ {label}{suffix}\n")),
-            ResetColor
-        )?;
-        out.flush()
-    }
-
-    /// Clear the spinner line without leaving a permanent artefact. Useful
-    /// when a following renderer wants to own the transcript line (for
-    /// example when we begin streaming assistant markdown).
-    #[allow(dead_code)]
-    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
-        self.reset();
-        execute!(
-            out,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            ResetColor
-        )?;
-        out.flush()
     }
 }
 
@@ -316,11 +146,6 @@ impl TerminalRenderer {
     }
 
     #[must_use]
-    pub fn color_theme(&self) -> &ColorTheme {
-        &self.color_theme
-    }
-
-    #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
         let mut output = String::new();
         let mut state = RenderState::default();
@@ -358,7 +183,7 @@ impl TerminalRenderer {
     ) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                self.start_heading(level as u8, state, output)
+                self.start_heading(level as u8, state, output);
             }
             Event::End(TagEnd::Heading(..)) => {
                 state.heading_level = None;
@@ -642,6 +467,9 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn highlight_code(&self, code: &str, language: &str) -> String {
+        if !crate::ui::color_output_is_enabled() {
+            return code.to_string();
+        }
         let syntax = self
             .syntax_set
             .find_syntax_by_token(language)
@@ -769,7 +597,7 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{strip_ansi, MarkdownStreamState, TerminalRenderer};
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -822,22 +650,6 @@ mod tests {
         assert_eq!(lines[2], "│ alpha │ 1     │");
         assert_eq!(lines[3], "│ beta  │ 22    │");
         assert!(markdown_output.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn spinner_advances_frames() {
-        let terminal_renderer = TerminalRenderer::new();
-        let mut spinner = Spinner::new();
-        let mut out = Vec::new();
-        spinner
-            .tick("Working", terminal_renderer.color_theme(), &mut out)
-            .expect("tick succeeds");
-        spinner
-            .tick("Working", terminal_renderer.color_theme(), &mut out)
-            .expect("tick succeeds");
-
-        let output = String::from_utf8_lossy(&out);
-        assert!(output.contains("Working"));
     }
 
     #[test]

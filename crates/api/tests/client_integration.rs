@@ -181,6 +181,140 @@ async fn opencode_go_chat_models_translate_messages_to_chat_completions() {
 }
 
 #[tokio::test]
+async fn openai_compatible_providers_use_chat_completions_and_bearer_auth() {
+    for (service, model, expected_model) in [
+        (
+            ApiService::Neuralwatt,
+            "neuralwatt/zai-org/glm-5.2",
+            "zai-org/glm-5.2",
+        ),
+        (
+            ApiService::Lilac,
+            "lilac/moonshotai/kimi-k2.6",
+            "moonshotai/kimi-k2.6",
+        ),
+    ] {
+        let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let server = spawn_server(
+            state.clone(),
+            vec![http_response(
+                "200 OK",
+                "application/json",
+                r#"{"id":"chatcmpl_provider","object":"chat.completion","created":1,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
+            )],
+        )
+        .await;
+        let response = NanoGptClient::new("provider-key")
+            .with_service(service)
+            .with_base_url(server.base_url())
+            .send_message(&MessageRequest {
+                model: model.to_string(),
+                max_tokens: 32,
+                messages: vec![InputMessage::user_text("hello")],
+                system: Some("system".to_string()),
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                reasoning_effort: None,
+                fast_mode: false,
+                stream: false,
+            })
+            .await
+            .expect("provider request should succeed");
+        assert_eq!(
+            response.content[0],
+            OutputContentBlock::Text {
+                text: "ok".to_string()
+            }
+        );
+
+        let captured = state.lock().await;
+        let request = captured.first().expect("request should be captured");
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer provider-key")
+        );
+        assert!(!request.headers.contains_key("x-api-key"));
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+        assert_eq!(body["model"], json!(expected_model));
+    }
+}
+
+#[tokio::test]
+async fn openai_compatible_streams_text_tools_usage_and_vision_payloads() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Cargo.toml\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", body)],
+    )
+    .await;
+    let client = NanoGptClient::new("lilac-key")
+        .with_service(ApiService::Lilac)
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "lilac/moonshotai/kimi-k2.6".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![
+                    InputContentBlock::Text {
+                        text: "describe".to_string(),
+                    },
+                    InputContentBlock::Image {
+                        source: ImageSource {
+                            kind: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: "aGVsbG8=".to_string(),
+                        },
+                    },
+                ],
+                reasoning_content: None,
+                reasoning: None,
+            }],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
+            stream: true,
+        })
+        .await
+        .expect("stream should start");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("stream event") {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(event, StreamEvent::ContentBlockDelta(delta) if delta.delta == ContentBlockDelta::TextDelta { text: "Hel".to_string() })));
+    assert!(events.iter().any(|event| matches!(event, StreamEvent::ContentBlockStart(start) if matches!(&start.content_block, OutputContentBlock::ToolUse { id, name, .. } if id == "call_1" && name == "read_file"))));
+    assert!(events.iter().any(|event| matches!(event, StreamEvent::MessageDelta(delta) if delta.usage.input_tokens == 7 && delta.usage.output_tokens == 3)));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("request should be captured");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    assert_eq!(
+        body["messages"][0]["content"][1]["type"],
+        json!("image_url")
+    );
+    assert_eq!(
+        body["messages"][0]["content"][1]["image_url"]["url"],
+        json!("data:image/png;base64,aGVsbG8=")
+    );
+}
+
+#[tokio::test]
 async fn opencode_go_stream_message_emits_buffered_content_blocks() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(

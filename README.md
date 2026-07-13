@@ -1,17 +1,35 @@
 # Pebble
 
-Pebble is a rust based agentic coding harness
+Pebble is a Rust agentic coding harness with a fast, transcript-first terminal interface.
 
 It supports:
 
 - Nano-GPT
+- Neuralwatt
+- Lilac
+- Grok subscriptions through the official Grok CLI
 - Synthetic
 - OpenAI Codex / ChatGPT plans
 - OpenCode Go
 
 Pebble is designed around an interactive REPL, local tools, managed sessions, MCP servers, and a user-controlled permission model. Web retrieval is provider-agnostic and always runs through Exa.
 
-<img width="1571" height="504" alt="CleanShot 2026-04-21 at 21 54 52" src="https://github.com/user-attachments/assets/21eeb498-7f84-4c72-8fc2-718176ddf0ad" />
+```text
+◆ pebble  v0.4.7
+  gpt-5.5 on OpenAI Codex
+  build · workspace
+  ~/dev/my-project
+  /help for commands · Tab switches mode
+
+build ❯ find the flaky test and fix the root cause
+◇ Working...
+$ Shell  cargo test
+  └ ok: 0
+◆ Pebble
+The retry assertion was sharing state across test cases. I isolated the fixture
+and added a regression test.
+✓ Done in 8.4s · 3 tools · 2 files changed · 1.8k tokens · 4% context
+```
 
 
 Check the [Changelog](CHANGELOG.md) for update/patch notes
@@ -31,6 +49,9 @@ You can also target a specific service directly:
 
 ```bash
 pebble login synthetic
+pebble login neuralwatt
+pebble login lilac
+pebble login grok
 pebble login openai-codex
 pebble login opencode-go
 pebble login nanogpt
@@ -40,9 +61,25 @@ For API-key services, you can also pass the key inline:
 
 ```bash
 pebble login opencode-go --api-key "$OPENCODE_GO_API_KEY"
+pebble login neuralwatt --api-key "$NEURALWATT_API_KEY"
+pebble login lilac --api-key "$LILAC_API_KEY"
 ```
 
-`openai-codex` uses ChatGPT device-code auth instead of an API key.
+`openai-codex` uses ChatGPT device-code auth instead of an API key. `grok`
+launches `grok login` and uses the official Grok CLI's refreshable OAuth
+session, so Pebble never copies or stores xAI subscription tokens. Install the
+[official Grok CLI](https://docs.x.ai/build/overview) before connecting it.
+Pebble talks to that CLI over its ACP stdin/stdout protocol; prompts are never
+placed in process arguments. Grok replies render as ACP chunks arrive, and
+`Ctrl+C` cancels the entire active turn: HTTP streams, Grok ACP sessions, MCP
+calls, hooks, and foreground shell/REPL/PowerShell tools all receive the same
+cancellation signal and child processes are terminated. API-key logins are
+checked before invalid credentials are saved when the provider exposes a model
+catalog.
+
+Pebble automatically disables ANSI color when output is redirected, when
+`NO_COLOR` is set, with `CLICOLOR=0`, or under `TERM=dumb`. Set
+`CLICOLOR_FORCE=1` to keep color in redirected output.
 
 Inside the REPL, the equivalent commands are:
 
@@ -50,6 +87,7 @@ Inside the REPL, the equivalent commands are:
 /login
 /auth
 /login openai-codex
+/login grok
 /login opencode-go
 /auth synthetic
 /logout openai-codex
@@ -58,6 +96,9 @@ Inside the REPL, the equivalent commands are:
 If you run `/login` or `/auth` without a service, Pebble opens a picker with:
 
 - `nanogpt`
+- `neuralwatt`
+- `lilac`
+- `grok`
 - `synthetic`
 - `openai-codex`
 - `opencode-go`
@@ -93,6 +134,26 @@ export EXA_API_KEY=...
 ```
 
 ## Daily usage
+
+### Choose a provider and model
+
+Run `/model` to open the unified picker. Left and right switch providers,
+typing searches every provider at once, up and down move, and Enter selects.
+The provider rail shows which services are connected. Signed-out providers
+remain visible with the exact `/login` command they need, and a failed provider
+catalog no longer prevents other providers from loading.
+
+Provider catalogs are cached locally for instant startup and refreshed in the
+background after five minutes. The provider rail distinguishes fresh, cached,
+refreshing, and failed catalogs. Grok's model list comes from the installed
+official CLI, so it follows the user's subscription and CLI version.
+
+Neuralwatt and Lilac use their OpenAI-compatible chat-completions APIs. Model
+IDs are namespaced in Pebble, such as `neuralwatt/zai-org/glm-5.2` and
+`lilac/moonshotai/kimi-k2.6`, so the same upstream model can be selected from
+different providers without ambiguity. Both providers stream text, reasoning,
+tool calls, and usage natively; image attachments are sent as OpenAI-compatible
+image inputs when the selected model supports vision.
 
 ### Interactive REPL
 
@@ -140,6 +201,21 @@ pebble "Inspect the current Rust workspace and explain the top-level crates"
 ```bash
 pebble --allowedTools read,glob "Summarize Cargo.toml"
 ```
+
+### Safety limits
+
+Pebble stops runaway turns after 32 model passes. Foreground shell, REPL, and
+PowerShell commands default to a 10-minute timeout, and model API requests also
+time out after 10 minutes. Override these limits when a project needs more time:
+
+```bash
+export PEBBLE_MAX_TURN_ITERATIONS=48
+export PEBBLE_BASH_TIMEOUT_MS=900000
+export PEBBLE_TOOL_TIMEOUT_MS=900000
+export PEBBLE_API_TIMEOUT_SECS=900
+```
+
+An explicit tool-call timeout still takes precedence over the default.
 
 ### Eval suites and traces
 
@@ -266,6 +342,18 @@ Collect a redacted local support snapshot:
 pebble doctor bundle
 ```
 
+Probe every configured model provider without sending a model prompt or
+incurring inference usage:
+
+```bash
+pebble doctor providers
+pebble doctor providers --json
+```
+
+The provider report checks authentication and the live model catalog, records
+latency and model count, and states Pebble's streaming, tool-call, and vision
+transport support without printing credentials.
+
 The diagnostics bundle is written under `.pebble/diagnostics/` and includes
 offline doctor checks, config validation, local system metadata, session
 metadata, recent trace/eval summaries, and MCP discovery status. It excludes
@@ -286,6 +374,7 @@ Common commands:
 - `/login`
 - `/logout`
 - `/provider`
+- `/route`
 - `/permissions`
 - `/bypass`
 - `/proxy`
@@ -299,7 +388,8 @@ Common commands:
 
 Notes:
 
-- `/provider` only applies to NanoGPT-backed models.
+- `/provider [name]` opens model selection, optionally focused on one provider.
+- `/route` controls NanoGPT's upstream routing override and only applies to NanoGPT-backed models.
 - `Shift+Enter` and `Ctrl+J` insert a newline in the input editor.
 
 ## Authentication and config
@@ -575,7 +665,15 @@ cargo run -p pebble --
 
 ```bash
 cargo test --workspace -- --test-threads=1
+cargo build -p pebble
+python3 scripts/pty_smoke.py
 ```
+
+The PTY suite drives the compiled binary through onboarding, input interrupts,
+login and model pickers, narrow-terminal resizing, Unicode search, model and
+foreground-tool cancellation, plain redirected output, and clean exit. It runs
+on Linux and macOS with isolated temporary configuration and no provider
+credentials; CI also runs a Windows redirected-console smoke check.
 
 CI also runs the agent-harness safety checks that protect user-visible
 diagnostics and regression tooling:

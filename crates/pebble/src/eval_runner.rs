@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use api::ReasoningEffort;
 use compat_harness::{evaluate_trace, EvalCase, EvalCaseResult, EvalFailureKind};
-use crossterm::style::{Color, Stylize};
+use crossterm::style::Color;
 use platform::write_atomic;
 use runtime::PermissionMode;
 
@@ -17,6 +17,7 @@ use crate::eval::{
     write_eval_history_index, EvalRunCaseReport, EvalRunReport, EVAL_REPORT_SCHEMA_VERSION,
 };
 use crate::session_store::{append_undo_snapshot, build_turn_snapshot, WorktreeSnapshot};
+use crate::ui::Stylize;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_eval_suite(

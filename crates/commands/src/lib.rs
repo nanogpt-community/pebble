@@ -189,6 +189,24 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "provider",
+        aliases: &["providers"],
+        summary: "Choose a model provider",
+        argument_hint: Some("[name]"),
+        category: SlashCommandCategory::Core,
+        detail: "With no argument, opens the unified picker on the current provider. Pass `nanogpt`, `neuralwatt`, `lilac`, `grok`, `synthetic`, `openai-codex`, or `opencode-go` to focus it.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "route",
+        aliases: &["routing"],
+        summary: "Choose NanoGPT's upstream route",
+        argument_hint: Some("[route-id|default]"),
+        category: SlashCommandCategory::Core,
+        detail: "Only applies to NanoGPT models. With no argument, opens NanoGPT's route picker; `default` restores platform routing.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "logout",
         aliases: &[],
         summary: "Remove saved credentials for a service",
@@ -379,7 +397,7 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "auth",
         summary: "Authenticate model services and Exa",
-        detail: "Run `/login` or `/auth` with no argument to open a service picker, or `/logout [service]` to remove saved credentials. Supported services are `nanogpt`, `synthetic`, `openai-codex`, `opencode-go`, and `exa`. API keys are stored in `~/.pebble/credentials.json`; `openai-codex` stores device-code auth tokens there instead, and shell-scoped env vars still take precedence.",
+        detail: "Run `/login` or `/auth` with no argument to open a service picker, or `/logout [service]` to remove saved credentials. Model services are `nanogpt`, `neuralwatt`, `lilac`, `grok`, `synthetic`, `openai-codex`, and `opencode-go`; `exa` powers web tools. API keys and OpenAI device-code tokens live in `~/.pebble/credentials.json`. Grok OAuth stays in the official Grok CLI, and shell environment variables still take precedence.",
     },
     HelpTopic {
         name: "sessions",
@@ -420,6 +438,12 @@ pub enum SlashCommand {
     },
     Model {
         model: Option<String>,
+    },
+    Provider {
+        provider: Option<String>,
+    },
+    Route {
+        route: Option<String>,
     },
     Logout {
         service: Option<String>,
@@ -536,6 +560,12 @@ impl SlashCommand {
             },
             "model" => Self::Model {
                 model: parts.next().map(ToOwned::to_owned),
+            },
+            "provider" | "providers" => Self::Provider {
+                provider: parts.next().map(ToOwned::to_owned),
+            },
+            "route" | "routing" => Self::Route {
+                route: parts.next().map(ToOwned::to_owned),
             },
             "logout" => Self::Logout {
                 service: parts.next().map(ToOwned::to_owned),
@@ -795,6 +825,8 @@ pub fn handle_slash_command(
         | SlashCommand::Fast { .. }
         | SlashCommand::Mode { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Provider { .. }
+        | SlashCommand::Route { .. }
         | SlashCommand::Logout { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
@@ -1385,6 +1417,18 @@ mod tests {
             Some(SlashCommand::Model { model: None })
         );
         assert_eq!(
+            SlashCommand::parse("/provider lilac"),
+            Some(SlashCommand::Provider {
+                provider: Some("lilac".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/route default"),
+            Some(SlashCommand::Route {
+                route: Some("default".to_string()),
+            })
+        );
+        assert_eq!(
             SlashCommand::parse("/logout openai-codex"),
             Some(SlashCommand::Logout {
                 service: Some("openai-codex".to_string()),
@@ -1564,6 +1608,8 @@ mod tests {
         assert!(help.contains("/fast [on|off]"));
         assert!(help.contains("/mode [build|plan]"));
         assert!(help.contains("/model [model]"));
+        assert!(help.contains("/provider [name]"));
+        assert!(help.contains("/route [route-id|default]"));
         assert!(help.contains("/logout [service]"));
         assert!(help.contains("/mcp [status|tools|reload|add <name>|enable <name>|disable <name>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
@@ -1589,7 +1635,7 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|help|init <name>]"));
         assert!(help.contains("Help topics"));
-        assert_eq!(slash_command_specs().len(), 32);
+        assert_eq!(slash_command_specs().len(), 34);
         assert_eq!(resume_supported_slash_commands().len(), 15);
     }
 

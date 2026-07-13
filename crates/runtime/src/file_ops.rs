@@ -410,7 +410,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         .map(normalize_existing_workspace_path)
         .transpose()?
         .unwrap_or_else(|| workspace.clone());
-    let explicit_path = path.is_some();
+    let explicit_path = path.is_some() && base_dir != workspace;
     let pattern_path = if Path::new(pattern).is_absolute() {
         PathBuf::from(pattern)
     } else {
@@ -465,13 +465,14 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let workspace = workspace_root()?;
     let base_path = input
         .path
         .as_deref()
         .map(normalize_existing_workspace_path)
         .transpose()?
-        .unwrap_or(workspace_root()?);
-    let explicit_path = input.path.is_some();
+        .unwrap_or_else(|| workspace.clone());
+    let explicit_path = input.path.is_some() && base_path != workspace;
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -1964,6 +1965,16 @@ mod tests {
                     &format!("{dir}/skipped.txt"),
                 );
             }
+
+            let dot_grep = grep_search(&grep_input("needle", Some("."), "files_with_matches"))
+                .expect("dot-path grep should keep broad-search defaults");
+            assert_contains_relative_path(&dot_grep.filenames, workspace, "src/visible.txt");
+            assert_excludes_relative_path(&dot_grep.filenames, workspace, "ignored.txt");
+
+            let dot_glob =
+                glob_search("**/*.txt", Some(".")).expect("dot-path glob should succeed");
+            assert_contains_relative_path(&dot_glob.filenames, workspace, "src/visible.txt");
+            assert_excludes_relative_path(&dot_glob.filenames, workspace, "ignored.txt");
         });
     }
 

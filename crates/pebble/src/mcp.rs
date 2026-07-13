@@ -3,19 +3,19 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crossterm::style::Stylize;
 use platform::write_atomic;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::Value as JsonValue;
 
 use crate::proxy::RuntimeToolSpec;
 use crate::report::{report_label, report_title};
-use crate::ui;
+use crate::ui::{self, Stylize};
 use runtime::{
-    mcp_tool_name, spawn_mcp_stdio_process, ConfigLoader, ConfigSource, JsonRpcId, JsonRpcRequest,
-    JsonRpcResponse, McpClientAuth, McpClientBootstrap, McpClientTransport,
-    McpInitializeClientInfo, McpInitializeParams, McpListToolsParams, McpListToolsResult,
-    McpToolCallParams, McpToolCallResult, McpTransport, PermissionMode, ScopedMcpServerConfig,
+    mcp_tool_name, spawn_mcp_stdio_process, CancellationToken, ConfigLoader, ConfigSource,
+    JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpClientAuth, McpClientBootstrap,
+    McpClientTransport, McpInitializeClientInfo, McpInitializeParams, McpListToolsParams,
+    McpListToolsResult, McpToolCallParams, McpToolCallResult, McpTransport, PermissionMode,
+    ScopedMcpServerConfig,
 };
 
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
@@ -78,7 +78,7 @@ pub(crate) fn handle_mcp_action(action: McpCommand) -> Result<(), Box<dyn std::e
         McpCommand::Add { name } => println!("{}", add_mcp_server_interactive(&cwd, &name)?),
         McpCommand::Enable { name } => println!("{}", set_mcp_server_enabled(&cwd, &name, true)?),
         McpCommand::Disable { name } => {
-            println!("{}", set_mcp_server_enabled(&cwd, &name, false)?)
+            println!("{}", set_mcp_server_enabled(&cwd, &name, false)?);
         }
     }
     Ok(())
@@ -325,10 +325,8 @@ pub(crate) fn load_mcp_catalog(cwd: &Path) -> Result<McpCatalog, Box<dyn std::er
                 }
             },
             other => {
-                status.note = format!(
-                    "{:?} transport is configured but not executable in Pebble yet",
-                    other
-                );
+                status.note =
+                    format!("{other:?} transport is configured but not executable in Pebble yet");
             }
         }
 
@@ -437,11 +435,8 @@ fn load_stdio_mcp_tools(
         match result {
             Ok(result) => result,
             Err(_) => Err::<Vec<McpToolBinding>, Box<dyn std::error::Error>>(
-                format!(
-                    "timed out after {}s during stdio MCP discovery",
-                    MCP_DISCOVERY_TIMEOUT_SECS
-                )
-                .into(),
+                format!("timed out after {MCP_DISCOVERY_TIMEOUT_SECS}s during stdio MCP discovery")
+                    .into(),
             ),
         }
     })
@@ -539,24 +534,26 @@ fn load_http_mcp_tools(
 pub(crate) fn call_mcp_tool(
     binding: &McpToolBinding,
     input: &JsonValue,
+    cancellation: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error>> {
     match binding.config.transport() {
-        McpTransport::Stdio => call_stdio_mcp_tool(binding, input),
-        McpTransport::Http => call_http_mcp_tool(binding, input),
-        other => Err(format!("MCP transport {:?} is not executable in Pebble yet", other).into()),
+        McpTransport::Stdio => call_stdio_mcp_tool(binding, input, cancellation),
+        McpTransport::Http => call_http_mcp_tool(binding, input, cancellation),
+        other => Err(format!("MCP transport {other:?} is not executable in Pebble yet").into()),
     }
 }
 
 fn call_stdio_mcp_tool(
     binding: &McpToolBinding,
     input: &JsonValue,
+    cancellation: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let bootstrap = McpClientBootstrap::from_scoped_config(&binding.server_name, &binding.config);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let mut process = spawn_mcp_stdio_process(&bootstrap)?;
-        let initialize = process
-            .initialize(
+        let initialize = tokio::select! {
+            result = process.initialize(
                 JsonRpcId::Number(1),
                 McpInitializeParams {
                     protocol_version: "2025-03-26".to_string(),
@@ -566,8 +563,15 @@ fn call_stdio_mcp_tool(
                         version: VERSION.to_string(),
                     },
                 },
-            )
-            .await?;
+            ) => Some(result),
+            () = wait_for_cancellation(cancellation) => None,
+        };
+        let Some(initialize) = initialize else {
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            return Err("request cancelled".into());
+        };
+        let initialize = initialize?;
         if let Some(error) = initialize.error {
             let _ = process.terminate().await;
             let _ = process.wait().await;
@@ -577,16 +581,23 @@ fn call_stdio_mcp_tool(
         }
         process.send_initialized_notification().await?;
 
-        let response = process
-            .call_tool(
+        let response = tokio::select! {
+            result = process.call_tool(
                 JsonRpcId::Number(2),
                 McpToolCallParams {
                     name: binding.upstream_name.clone(),
                     arguments: Some(input.clone()),
                     meta: None,
                 },
-            )
-            .await?;
+            ) => Some(result),
+            () = wait_for_cancellation(cancellation) => None,
+        };
+        let Some(response) = response else {
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            return Err("request cancelled".into());
+        };
+        let response = response?;
         let _ = process.terminate().await;
         let _ = process.wait().await;
 
@@ -597,6 +608,7 @@ fn call_stdio_mcp_tool(
 fn call_http_mcp_tool(
     binding: &McpToolBinding,
     input: &JsonValue,
+    cancellation: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let McpClientTransport::Http(transport) =
         McpClientBootstrap::from_scoped_config(&binding.server_name, &binding.config).transport
@@ -615,16 +627,19 @@ fn call_http_mcp_tool(
     let upstream_name = binding.upstream_name.clone();
     let input = input.clone();
     runtime.block_on(async move {
-        let initialize = http_jsonrpc_request::<JsonValue>(
-            &transport.url,
-            &transport.headers,
-            JsonRpcId::Number(1),
-            "initialize",
-            Some(serde_json::json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": {"roots": {}},
-                "clientInfo": {"name": "pebble", "version": VERSION}
-            })),
+        let initialize = await_mcp_or_cancel(
+            http_jsonrpc_request::<JsonValue>(
+                &transport.url,
+                &transport.headers,
+                JsonRpcId::Number(1),
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"roots": {}},
+                    "clientInfo": {"name": "pebble", "version": VERSION}
+                })),
+            ),
+            cancellation,
         )
         .await?;
         if let Some(error) = initialize.error {
@@ -632,28 +647,50 @@ fn call_http_mcp_tool(
                 format!("initialize failed: {}", error.message).into(),
             );
         }
-        http_jsonrpc_notification(
-            &transport.url,
-            &transport.headers,
-            "notifications/initialized",
-            Some(serde_json::json!({})),
+        await_mcp_or_cancel(
+            http_jsonrpc_notification(
+                &transport.url,
+                &transport.headers,
+                "notifications/initialized",
+                Some(serde_json::json!({})),
+            ),
+            cancellation,
         )
         .await?;
 
-        let response = http_jsonrpc_request::<McpToolCallResult>(
-            &transport.url,
-            &transport.headers,
-            JsonRpcId::Number(2),
-            "tools/call",
-            Some(serde_json::to_value(McpToolCallParams {
-                name: upstream_name.clone(),
-                arguments: Some(input),
-                meta: None,
-            })?),
+        let response = await_mcp_or_cancel(
+            http_jsonrpc_request::<McpToolCallResult>(
+                &transport.url,
+                &transport.headers,
+                JsonRpcId::Number(2),
+                "tools/call",
+                Some(serde_json::to_value(McpToolCallParams {
+                    name: upstream_name.clone(),
+                    arguments: Some(input),
+                    meta: None,
+                })?),
+            ),
+            cancellation,
         )
         .await?;
         format_mcp_call_result(&server_name, &upstream_name, response)
     })
+}
+
+async fn await_mcp_or_cancel<T>(
+    future: impl std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+    cancellation: &CancellationToken,
+) -> Result<T, Box<dyn std::error::Error>> {
+    tokio::select! {
+        result = future => result,
+        () = wait_for_cancellation(cancellation) => Err("request cancelled".into()),
+    }
+}
+
+async fn wait_for_cancellation(cancellation: &CancellationToken) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 async fn http_jsonrpc_request<TResult: serde::de::DeserializeOwned>(

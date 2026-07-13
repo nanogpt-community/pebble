@@ -38,6 +38,8 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "NanoGPT Messages API";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const MAX_MEMORY_FILE_CHARS: usize = 3_000;
+const MAX_TOTAL_MEMORY_CHARS: usize = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -267,14 +269,36 @@ fn discover_memory_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         let mut paths = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.is_file())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            matches!(extension.to_ascii_lowercase().as_str(), "md" | "txt")
+                        })
+            })
             .collect::<Vec<_>>();
-        paths.sort();
-        for path in paths {
+        for path in select_memory_paths(&mut paths) {
             push_context_file(&mut files, path)?;
         }
     }
     Ok(dedupe_instruction_files(files))
+}
+
+fn select_memory_paths(paths: &mut [PathBuf]) -> Vec<PathBuf> {
+    paths.sort();
+    paths
+        .iter()
+        .filter(|path| !is_generated_summary(path))
+        .cloned()
+        .collect()
+}
+
+fn is_generated_summary(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("summary-"))
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
@@ -578,16 +602,31 @@ fn render_relative_paths(paths: &[PathBuf], root: &Path) -> Vec<String> {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    render_context_file_section("# Pebble instructions", files)
+    render_context_file_section(
+        "# Pebble instructions",
+        files,
+        MAX_INSTRUCTION_FILE_CHARS,
+        MAX_TOTAL_INSTRUCTION_CHARS,
+    )
 }
 
 fn render_memory_files(files: &[ContextFile]) -> String {
-    render_context_file_section("# Project memory", files)
+    render_context_file_section(
+        "# Project memory",
+        files,
+        MAX_MEMORY_FILE_CHARS,
+        MAX_TOTAL_MEMORY_CHARS,
+    )
 }
 
-fn render_context_file_section(title: &str, files: &[ContextFile]) -> String {
+fn render_context_file_section(
+    title: &str,
+    files: &[ContextFile],
+    max_file_chars: usize,
+    max_total_chars: usize,
+) -> String {
     let mut sections = vec![title.to_string()];
-    let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
+    let mut remaining_chars = max_total_chars;
     for file in files {
         if remaining_chars == 0 {
             sections.push(
@@ -597,7 +636,8 @@ fn render_context_file_section(title: &str, files: &[ContextFile]) -> String {
             break;
         }
 
-        let raw_content = truncate_instruction_content(&file.content, remaining_chars);
+        let raw_content =
+            truncate_instruction_content(&file.content, remaining_chars.min(max_file_chars));
         let rendered_content = render_instruction_content(&raw_content);
         let consumed = rendered_content.chars().count().min(remaining_chars);
         remaining_chars = remaining_chars.saturating_sub(consumed);
@@ -923,6 +963,16 @@ mod tests {
             "nested memory",
         )
         .expect("write nested memory");
+        fs::write(
+            root.join(".pebble").join("memory").join("summary-100.md"),
+            "old generated summary",
+        )
+        .expect("write old summary");
+        fs::write(
+            root.join(".pebble").join("memory").join("summary-200.md"),
+            "latest generated summary",
+        )
+        .expect("write latest summary");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         let contents = context
@@ -932,6 +982,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(contents, vec!["root memory", "nested memory"]);
+        assert!(!contents.contains(&"old generated summary"));
+        assert!(!contents.contains(&"latest generated summary"));
         assert!(render_memory_files(&context.memory_files).contains("# Project memory"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -958,6 +1010,25 @@ mod tests {
         let rendered = render_instruction_content(&"x".repeat(4500));
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.len() < 4_100);
+    }
+
+    #[test]
+    fn project_memory_has_a_smaller_independent_prompt_budget() {
+        let files = vec![
+            ContextFile {
+                path: PathBuf::from("memory-one.md"),
+                content: "a".repeat(4_000),
+            },
+            ContextFile {
+                path: PathBuf::from("memory-two.md"),
+                content: "b".repeat(4_000),
+            },
+        ];
+
+        let rendered = render_memory_files(&files);
+
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.chars().count() < 5_300);
     }
 
     #[test]

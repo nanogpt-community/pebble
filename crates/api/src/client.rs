@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -22,11 +22,16 @@ const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api";
 const DEFAULT_SYNTHETIC_MESSAGES_BASE_URL: &str = "https://api.synthetic.new/anthropic/v1";
 const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go";
 const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_NEURALWATT_BASE_URL: &str = "https://api.neuralwatt.com";
+const DEFAULT_LILAC_BASE_URL: &str = "https://api.getlilac.com";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_API_TIMEOUT_SECS: u64 = 10 * 60;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 20;
+const API_TIMEOUT_ENV_VAR: &str = "PEBBLE_API_TIMEOUT_SECS";
 const OPENAI_CODEX_REFRESH_EARLY_MS: u64 = 30_000;
 const OPENAI_CODEX_CREDENTIALS_KEY: &str = "openai_codex_auth";
 pub const OPENAI_CODEX_ISSUER: &str = "https://auth.openai.com";
@@ -72,7 +77,7 @@ impl NanoGptClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             api_key: api_key.into(),
             openai_codex_auth: None,
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -137,6 +142,20 @@ impl NanoGptClient {
         self
     }
 
+    /// Rebuild the HTTP client with a shorter request deadline for interactive
+    /// probes such as credential verification.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        if let Ok(http) = reqwest::Client::builder()
+            .connect_timeout(timeout.min(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)))
+            .timeout(timeout)
+            .build()
+        {
+            self.http = http;
+        }
+        self
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
@@ -144,7 +163,9 @@ impl NanoGptClient {
         if self.service == ApiService::OpenAiCodex {
             return self.send_openai_codex_response(request).await;
         }
-        if self.service == ApiService::OpencodeGo && !opencode_go_uses_messages_api(&request.model)
+        if matches!(self.service, ApiService::Neuralwatt | ApiService::Lilac)
+            || (self.service == ApiService::OpencodeGo
+                && !opencode_go_uses_messages_api(&request.model))
         {
             return self.send_opencode_go_chat_completion(request).await;
         }
@@ -199,9 +220,21 @@ impl NanoGptClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        if matches!(self.service, ApiService::Neuralwatt | ApiService::Lilac) {
+            let chat_request = message_request_to_chat_completion_request(
+                &request.clone().with_streaming(),
+                self,
+            )?;
+            let response =
+                expect_success(self.send_chat_completion_raw(&chat_request).await?).await?;
+            return Ok(MessageStream::from_openai_response(response));
+        }
         if matches!(
             self.service,
-            ApiService::OpenAiCodex | ApiService::OpencodeGo
+            ApiService::OpenAiCodex
+                | ApiService::OpencodeGo
+                | ApiService::Neuralwatt
+                | ApiService::Lilac
         ) {
             let response = self.send_message(request).await?;
             return Ok(MessageStream::from_message_response(response));
@@ -482,7 +515,11 @@ impl NanoGptClient {
                     request_builder.header("originator", OPENAI_CODEX_ORIGINATOR)
                 }
             }
-            ApiService::NanoGpt | ApiService::Synthetic | ApiService::OpencodeGo
+            ApiService::NanoGpt
+            | ApiService::Synthetic
+            | ApiService::OpencodeGo
+            | ApiService::Neuralwatt
+            | ApiService::Lilac
                 if self.api_key.is_empty() =>
             {
                 if debug {
@@ -500,12 +537,13 @@ impl NanoGptClient {
                     .bearer_auth(&self.api_key)
                     .header("x-api-key", &self.api_key)
             }
-            ApiService::Synthetic => {
+            ApiService::Synthetic | ApiService::Neuralwatt | ApiService::Lilac => {
                 if debug {
                     eprintln!("[nanogpt-client] headers authorization=Bearer [REDACTED]");
                 }
                 request_builder.bearer_auth(&self.api_key)
             }
+            ApiService::Grok => request_builder,
         };
 
         if include_provider {
@@ -542,15 +580,19 @@ impl NanoGptClient {
     fn messages_path(&self) -> &'static str {
         match self.service {
             ApiService::NanoGpt | ApiService::OpencodeGo => "/v1/messages",
-            ApiService::Synthetic => "/messages",
+            ApiService::Synthetic | ApiService::Grok => "/messages",
             ApiService::OpenAiCodex => "/responses",
+            ApiService::Neuralwatt | ApiService::Lilac => "/v1/chat/completions",
         }
     }
 
     fn chat_completions_path(&self) -> &'static str {
         match self.service {
-            ApiService::NanoGpt | ApiService::OpencodeGo => "/v1/chat/completions",
-            ApiService::Synthetic => "/chat/completions",
+            ApiService::NanoGpt
+            | ApiService::OpencodeGo
+            | ApiService::Neuralwatt
+            | ApiService::Lilac => "/v1/chat/completions",
+            ApiService::Synthetic | ApiService::Grok => "/chat/completions",
             ApiService::OpenAiCodex => "/responses",
         }
     }
@@ -565,6 +607,12 @@ impl NanoGptClient {
         match self.service {
             ApiService::OpenAiCodex => normalize_openai_codex_model_id(model).to_string(),
             ApiService::OpencodeGo => normalize_opencode_go_model_id(model).to_string(),
+            ApiService::Neuralwatt => model
+                .strip_prefix("neuralwatt/")
+                .unwrap_or(model)
+                .to_string(),
+            ApiService::Lilac => model.strip_prefix("lilac/").unwrap_or(model).to_string(),
+            ApiService::Grok => model.strip_prefix("grok/").unwrap_or(model).to_string(),
             ApiService::NanoGpt | ApiService::Synthetic => model.to_string(),
         }
     }
@@ -573,7 +621,9 @@ impl NanoGptClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
-        let chat_request = message_request_to_chat_completion_request(request, self)?;
+        let mut chat_request = message_request_to_chat_completion_request(request, self)?;
+        chat_request.stream = false;
+        chat_request.stream_options = None;
         let response = self.send_chat_completion_with_retry(&chat_request).await?;
         let request_id = request_id_from_headers(response.headers());
         let response = response
@@ -714,6 +764,25 @@ impl NanoGptClient {
     }
 }
 
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(api_timeout_secs()))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn api_timeout_secs() -> u64 {
+    parse_api_timeout_secs(std::env::var(API_TIMEOUT_ENV_VAR).ok().as_deref())
+}
+
+fn parse_api_timeout_secs(value: Option<&str>) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|timeout_secs| *timeout_secs > 0)
+        .unwrap_or(DEFAULT_API_TIMEOUT_SECS)
+}
+
 fn read_api_key() -> Result<String, ApiError> {
     resolve_api_key_for(ApiService::NanoGpt)
 }
@@ -725,6 +794,9 @@ pub enum ApiService {
     Synthetic,
     OpenAiCodex,
     OpencodeGo,
+    Neuralwatt,
+    Lilac,
+    Grok,
 }
 
 impl ApiService {
@@ -735,6 +807,9 @@ impl ApiService {
             Self::Synthetic => "synthetic",
             Self::OpenAiCodex => "openai_codex",
             Self::OpencodeGo => "opencode_go",
+            Self::Neuralwatt => "neuralwatt",
+            Self::Lilac => "lilac",
+            Self::Grok => "grok",
         }
     }
 
@@ -745,12 +820,18 @@ impl ApiService {
             Self::Synthetic => "Synthetic",
             Self::OpenAiCodex => "OpenAI Codex",
             Self::OpencodeGo => "OpenCode Go",
+            Self::Neuralwatt => "Neuralwatt",
+            Self::Lilac => "Lilac",
+            Self::Grok => "Grok",
         }
     }
 }
 
 pub fn resolve_api_key_for(service: ApiService) -> Result<String, ApiError> {
-    if service == ApiService::OpenAiCodex {
+    if matches!(service, ApiService::OpenAiCodex | ApiService::Grok) {
+        if service == ApiService::Grok {
+            return Err(ApiError::MissingApiKey);
+        }
         return resolve_openai_codex_credentials().map(|credentials| credentials.access_token);
     }
     match std::env::var(service_api_key_env(service)) {
@@ -779,6 +860,12 @@ pub fn resolve_base_url_for(service: ApiService) -> String {
             .unwrap_or_else(|_| DEFAULT_OPENAI_CODEX_BASE_URL.to_string()),
         ApiService::OpencodeGo => std::env::var("OPENCODE_GO_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_OPENCODE_GO_BASE_URL.to_string()),
+        ApiService::Neuralwatt => std::env::var("NEURALWATT_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_NEURALWATT_BASE_URL.to_string()),
+        ApiService::Lilac => {
+            std::env::var("LILAC_BASE_URL").unwrap_or_else(|_| DEFAULT_LILAC_BASE_URL.to_string())
+        }
+        ApiService::Grok => "grok-cli://local".to_string(),
     }
 }
 
@@ -801,7 +888,11 @@ pub fn resolve_root_url_for(service: ApiService) -> String {
                 .unwrap_or(trimmed)
                 .to_string()
         }
-        ApiService::OpenAiCodex | ApiService::OpencodeGo => resolve_base_url_for(service),
+        ApiService::OpenAiCodex
+        | ApiService::OpencodeGo
+        | ApiService::Neuralwatt
+        | ApiService::Lilac
+        | ApiService::Grok => resolve_base_url_for(service),
     }
 }
 
@@ -877,8 +968,10 @@ fn read_api_key_from_credentials_file(service: ApiService) -> Option<String> {
     let service_key = match service {
         ApiService::NanoGpt => "nanogpt_api_key",
         ApiService::Synthetic => "synthetic_api_key",
-        ApiService::OpenAiCodex => return None,
+        ApiService::OpenAiCodex | ApiService::Grok => return None,
         ApiService::OpencodeGo => "opencode_go_api_key",
+        ApiService::Neuralwatt => "neuralwatt_api_key",
+        ApiService::Lilac => "lilac_api_key",
     };
     parsed
         .get(service_key)
@@ -898,6 +991,9 @@ fn service_api_key_env(service: ApiService) -> &'static str {
         ApiService::Synthetic => "SYNTHETIC_API_KEY",
         ApiService::OpenAiCodex => "OPENAI_CODEX_ACCESS_TOKEN",
         ApiService::OpencodeGo => "OPENCODE_GO_API_KEY",
+        ApiService::Neuralwatt => "NEURALWATT_API_KEY",
+        ApiService::Lilac => "LILAC_API_KEY",
+        ApiService::Grok => "GROK_ACCESS_TOKEN",
     }
 }
 
@@ -962,6 +1058,11 @@ enum MessageStreamState {
         parser: SseParser,
         done: bool,
     },
+    OpenAiHttp {
+        response: reqwest::Response,
+        parser: OpenAiSseParser,
+        done: bool,
+    },
     Buffered,
 }
 
@@ -983,6 +1084,18 @@ impl MessageStream {
             request_id: response.request_id.clone(),
             state: MessageStreamState::Buffered,
             pending: VecDeque::from(message_response_to_stream_events(response)),
+        }
+    }
+
+    fn from_openai_response(response: reqwest::Response) -> Self {
+        Self {
+            request_id: request_id_from_headers(response.headers()),
+            state: MessageStreamState::OpenAiHttp {
+                response,
+                parser: OpenAiSseParser::default(),
+                done: false,
+            },
+            pending: VecDeque::new(),
         }
     }
 
@@ -1022,9 +1135,274 @@ impl MessageStream {
                         }
                     }
                 }
+                MessageStreamState::OpenAiHttp {
+                    response,
+                    parser,
+                    done,
+                } => {
+                    if *done {
+                        self.pending.extend(parser.finish()?);
+                        if let Some(event) = self.pending.pop_front() {
+                            return Ok(Some(event));
+                        }
+                        return Ok(None);
+                    }
+                    match response.chunk().await? {
+                        Some(chunk) => self.pending.extend(parser.push(&chunk)?),
+                        None => *done = true,
+                    }
+                }
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct OpenAiSseParser {
+    buffer: Vec<u8>,
+    text_started: bool,
+    thinking_started: bool,
+    tools: BTreeMap<u32, OpenAiStreamTool>,
+    usage: Usage,
+    stopped: bool,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamTool {
+    id: String,
+    name: String,
+    pending_arguments: String,
+}
+
+impl OpenAiSseParser {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ApiError> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(frame) = take_sse_frame(&mut self.buffer) {
+            events.extend(self.parse_frame(&frame)?);
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let trailing = String::from_utf8_lossy(&std::mem::take(&mut self.buffer)).into_owned();
+            events.extend(self.parse_frame(&trailing)?);
+        }
+        if !self.stopped {
+            events.extend(self.stop_events());
+        }
+        Ok(events)
+    }
+
+    fn parse_frame(&mut self, frame: &str) -> Result<Vec<StreamEvent>, ApiError> {
+        let payload = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if payload.is_empty() {
+            return Ok(Vec::new());
+        }
+        if payload == "[DONE]" {
+            return Ok(self.stop_events());
+        }
+        let value: Value = serde_json::from_str(&payload)?;
+        reject_openai_stream_error(&value, &payload)?;
+        record_openai_usage(&value, &mut self.usage);
+        let mut events = Vec::new();
+        let Some(delta) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+        else {
+            return Ok(events);
+        };
+        if let Some(thinking) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            if !self.thinking_started {
+                self.thinking_started = true;
+                events.push(StreamEvent::ContentBlockStart(
+                    crate::types::ContentBlockStartEvent {
+                        index: 1,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    },
+                ));
+            }
+            events.push(StreamEvent::ContentBlockDelta(
+                crate::types::ContentBlockDeltaEvent {
+                    index: 1,
+                    delta: crate::types::ContentBlockDelta::ThinkingDelta {
+                        thinking: thinking.to_string(),
+                    },
+                },
+            ));
+        }
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            if !self.text_started {
+                self.text_started = true;
+                events.push(StreamEvent::ContentBlockStart(
+                    crate::types::ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Text {
+                            text: String::new(),
+                        },
+                    },
+                ));
+            }
+            events.push(StreamEvent::ContentBlockDelta(
+                crate::types::ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: crate::types::ContentBlockDelta::TextDelta {
+                        text: text.to_string(),
+                    },
+                },
+            ));
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let ordinal = call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .try_into()
+                    .unwrap_or(u32::MAX);
+                let tool = self.tools.entry(ordinal).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    tool.id.push_str(id);
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        tool.name.push_str(name);
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        tool.pending_arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn stop_events(&mut self) -> Vec<StreamEvent> {
+        if self.stopped {
+            return Vec::new();
+        }
+        self.stopped = true;
+        let mut events = Vec::new();
+        for (ordinal, tool) in &self.tools {
+            if !tool.id.is_empty() && !tool.name.is_empty() {
+                events.push(StreamEvent::ContentBlockStart(
+                    crate::types::ContentBlockStartEvent {
+                        index: ordinal + 10,
+                        content_block: OutputContentBlock::ToolUse {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            input: Value::Object(serde_json::Map::new()),
+                        },
+                    },
+                ));
+                if !tool.pending_arguments.is_empty() {
+                    events.push(StreamEvent::ContentBlockDelta(
+                        crate::types::ContentBlockDeltaEvent {
+                            index: ordinal + 10,
+                            delta: crate::types::ContentBlockDelta::InputJsonDelta {
+                                partial_json: tool.pending_arguments.clone(),
+                            },
+                        },
+                    ));
+                }
+                events.push(StreamEvent::ContentBlockStop(
+                    crate::types::ContentBlockStopEvent {
+                        index: ordinal + 10,
+                    },
+                ));
+            }
+        }
+        if self.thinking_started {
+            events.push(StreamEvent::ContentBlockStop(
+                crate::types::ContentBlockStopEvent { index: 1 },
+            ));
+        }
+        if self.text_started {
+            events.push(StreamEvent::ContentBlockStop(
+                crate::types::ContentBlockStopEvent { index: 0 },
+            ));
+        }
+        events.push(StreamEvent::MessageDelta(crate::types::MessageDeltaEvent {
+            delta: crate::types::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: self.usage.clone(),
+        }));
+        events.push(StreamEvent::MessageStop(crate::types::MessageStopEvent {}));
+        events
+    }
+}
+
+fn reject_openai_stream_error(value: &Value, payload: &str) -> Result<(), ApiError> {
+    let Some(error) = value.get("error") else {
+        return Ok(());
+    };
+    Err(ApiError::StreamApi {
+        error_type: error
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body: payload.to_string(),
+    })
+}
+
+fn record_openai_usage(value: &Value, usage: &mut Usage) {
+    let Some(frame_usage) = value.get("usage") else {
+        return;
+    };
+    usage.input_tokens = frame_usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    usage.output_tokens = frame_usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX);
+}
+
+fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
+    let separator = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| (position, 2))
+        .or_else(|| {
+            buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| (position, 4))
+        })?;
+    let (position, length) = separator;
+    let frame = buffer.drain(..position + length).collect::<Vec<_>>();
+    Some(String::from_utf8_lossy(&frame[..position]).into_owned())
 }
 
 fn normalize_opencode_go_model_id(model: &str) -> &str {
@@ -1682,7 +2060,13 @@ fn message_request_to_chat_completion_request(
         thinking: (client.service == ApiService::OpencodeGo
             && opencode_go_prefers_thinking_disabled(&request.model))
         .then(ChatCompletionThinkingConfig::disabled),
-        stream: false,
+        reasoning_effort: request.reasoning_effort,
+        stream_options: request
+            .stream
+            .then_some(crate::types::ChatCompletionStreamOptions {
+                include_usage: true,
+            }),
+        stream: request.stream,
     })
 }
 
@@ -1752,13 +2136,18 @@ fn user_input_to_chat_completion_messages(
     message: &crate::types::InputMessage,
 ) -> Result<Vec<ChatCompletionMessage>, ApiError> {
     let mut messages = Vec::new();
-    let mut pending_text = Vec::new();
+    let mut pending_parts = Vec::new();
+    let mut has_image = false;
 
     for block in &message.content {
         match block {
             crate::types::InputContentBlock::Text { text } => {
                 if !text.is_empty() {
-                    pending_text.push(text.clone());
+                    pending_parts.push(crate::types::ChatCompletionContentPart {
+                        kind: "text".to_string(),
+                        text: Some(text.clone()),
+                        image_url: None,
+                    });
                 }
             }
             crate::types::InputContentBlock::ToolResult {
@@ -1766,16 +2155,19 @@ fn user_input_to_chat_completion_messages(
                 content,
                 ..
             } => {
-                if !pending_text.is_empty() {
+                if !pending_parts.is_empty() {
                     messages.push(ChatCompletionMessage {
                         role: "user".to_string(),
-                        content: Some(ChatCompletionContent::Text(pending_text.join("\n\n"))),
+                        content: Some(chat_content_from_parts(
+                            std::mem::take(&mut pending_parts),
+                            has_image,
+                        )),
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
                         reasoning: None,
                     });
-                    pending_text.clear();
+                    has_image = false;
                 }
                 messages.push(ChatCompletionMessage {
                     role: "tool".to_string(),
@@ -1788,10 +2180,15 @@ fn user_input_to_chat_completion_messages(
                     reasoning: None,
                 });
             }
-            crate::types::InputContentBlock::Image { .. } => {
-                return Err(invalid_request_error(
-                    "image inputs are not supported for OpenCode Go chat/completions models",
-                ));
+            crate::types::InputContentBlock::Image { source } => {
+                has_image = true;
+                pending_parts.push(crate::types::ChatCompletionContentPart {
+                    kind: "image_url".to_string(),
+                    text: None,
+                    image_url: Some(crate::types::ChatCompletionImageUrl {
+                        url: format!("data:{};base64,{}", source.media_type, source.data),
+                    }),
+                });
             }
             crate::types::InputContentBlock::ToolUse { .. } => {
                 return Err(invalid_request_error(
@@ -1801,10 +2198,10 @@ fn user_input_to_chat_completion_messages(
         }
     }
 
-    if !pending_text.is_empty() {
+    if !pending_parts.is_empty() {
         messages.push(ChatCompletionMessage {
             role: "user".to_string(),
-            content: Some(ChatCompletionContent::Text(pending_text.join("\n\n"))),
+            content: Some(chat_content_from_parts(pending_parts, has_image)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -1813,6 +2210,23 @@ fn user_input_to_chat_completion_messages(
     }
 
     Ok(messages)
+}
+
+fn chat_content_from_parts(
+    parts: Vec<crate::types::ChatCompletionContentPart>,
+    has_image: bool,
+) -> ChatCompletionContent {
+    if has_image {
+        ChatCompletionContent::Parts(parts)
+    } else {
+        ChatCompletionContent::Text(
+            parts
+                .into_iter()
+                .filter_map(|part| part.text)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
 }
 
 fn tool_result_content_to_string(
@@ -2032,7 +2446,9 @@ struct OpenAiCodexRefreshResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use super::{
+        parse_api_timeout_secs, ALT_REQUEST_ID_HEADER, DEFAULT_API_TIMEOUT_SECS, REQUEST_ID_HEADER,
+    };
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
@@ -2053,6 +2469,17 @@ mod tests {
                 .expect("time should be after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn api_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_api_timeout_secs(None), DEFAULT_API_TIMEOUT_SECS);
+        assert_eq!(parse_api_timeout_secs(Some("45")), 45);
+        assert_eq!(parse_api_timeout_secs(Some("0")), DEFAULT_API_TIMEOUT_SECS);
+        assert_eq!(
+            parse_api_timeout_secs(Some("not-a-number")),
+            DEFAULT_API_TIMEOUT_SECS
+        );
     }
 
     #[test]

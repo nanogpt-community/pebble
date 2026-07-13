@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
+use crate::cancellation::CancellationToken;
 use crate::compact::{
     compact_session_with_summary, estimate_session_tokens, prepare_compaction,
     prune_old_tool_results, CompactionConfig, CompactionResult,
@@ -19,6 +20,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 200_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "PEBBLE_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_MAX_TURN_ITERATIONS: usize = 32;
+const MAX_TURN_ITERATIONS_ENV_VAR: &str = "PEBBLE_MAX_TURN_ITERATIONS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -42,15 +45,47 @@ pub enum AssistantEvent {
 
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    fn stream_cancellable(
+        &mut self,
+        request: ApiRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled());
+        }
+        let events = self.stream(request)?;
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled());
+        }
+        Ok(events)
+    }
 }
 
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn execute_cancellable(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
+        let output = self.execute(tool_name, input)?;
+        if cancellation.is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     message: String,
+    cancelled: bool,
 }
 
 impl ToolError {
@@ -58,7 +93,21 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "request cancelled".to_string(),
+            cancelled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -73,6 +122,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    cancelled: bool,
 }
 
 impl RuntimeError {
@@ -80,7 +130,21 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "request cancelled".to_string(),
+            cancelled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -162,7 +226,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: usize::MAX,
+            max_iterations: max_turn_iterations_from_env(),
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             compaction_config: feature_config.compaction(),
@@ -174,7 +238,7 @@ where
 
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.max_iterations = max_iterations;
+        self.max_iterations = max_iterations.max(1);
         self
     }
 
@@ -199,19 +263,24 @@ where
         self
     }
 
-    fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+    fn run_pre_tool_use_hook(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        abort_signal: &HookAbortSignal,
+    ) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 Some(reporter.as_mut()),
             )
         } else {
             self.hook_runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 None,
             )
         }
@@ -223,6 +292,7 @@ where
         input: &str,
         output: &str,
         is_error: bool,
+        abort_signal: &HookAbortSignal,
     ) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_post_tool_use_with_context(
@@ -230,7 +300,7 @@ where
                 input,
                 output,
                 is_error,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 Some(reporter.as_mut()),
             )
         } else {
@@ -239,7 +309,7 @@ where
                 input,
                 output,
                 is_error,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 None,
             )
         }
@@ -250,13 +320,14 @@ where
         tool_name: &str,
         input: &str,
         output: &str,
+        abort_signal: &HookAbortSignal,
     ) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_post_tool_use_failure_with_context(
                 tool_name,
                 input,
                 output,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 Some(reporter.as_mut()),
             )
         } else {
@@ -264,7 +335,7 @@ where
                 tool_name,
                 input,
                 output,
-                Some(&self.hook_abort_signal),
+                Some(abort_signal),
                 None,
             )
         }
@@ -274,8 +345,23 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
+        let cancellation = self.hook_abort_signal.cancellation_token();
+        self.run_turn_cancellable(user_input, prompter, &cancellation)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_cancellable(
+        &mut self,
+        user_input: impl Into<String>,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+        cancellation: &CancellationToken,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled());
+        }
+        let hook_abort_signal = HookAbortSignal::from_cancellation(cancellation);
         let user_input = user_input.into();
         let mut trace = TurnTrace::start(&user_input, self.session.messages.len());
         self.session
@@ -289,11 +375,15 @@ where
         let mut auto_compaction_event = AutoCompactionEvent::default();
 
         loop {
+            if cancellation.is_cancelled() {
+                return Err(RuntimeError::cancelled());
+            }
             iterations += 1;
             if iterations > self.max_iterations {
-                return Err(RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
-                ));
+                return Err(RuntimeError::new(format!(
+                    "turn stopped after {} model passes; ask Pebble to continue or raise {MAX_TURN_ITERATIONS_ENV_VAR}",
+                    self.max_iterations
+                )));
             }
 
             let mut compacted_for_overflow = false;
@@ -315,7 +405,7 @@ where
                 };
                 let started = Instant::now();
 
-                match self.api_client.stream(request) {
+                match self.api_client.stream_cancellable(request, cancellation) {
                     Ok(events) => {
                         trace.api_calls.push(ApiCallTrace {
                             iteration: iterations,
@@ -387,7 +477,14 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
-                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::cancelled());
+                }
+                let pre_hook_result =
+                    self.run_pre_tool_use_hook(&tool_name, &input, &hook_abort_signal);
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::cancelled());
+                }
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
@@ -456,11 +553,16 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         let tool_started = Instant::now();
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
+                        let (mut output, mut is_error) = match self
+                            .tool_executor
+                            .execute_cancellable(&tool_name, &effective_input, cancellation)
+                        {
+                            Ok(output) => (output, false),
+                            Err(error) if error.is_cancelled() => {
+                                return Err(RuntimeError::cancelled());
+                            }
+                            Err(error) => (error.to_string(), true),
+                        };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let hook_output = output.clone();
@@ -469,6 +571,7 @@ where
                                 &tool_name,
                                 &effective_input,
                                 &hook_output,
+                                &hook_abort_signal,
                             )
                         } else {
                             self.run_post_tool_use_hook(
@@ -476,6 +579,7 @@ where
                                 &effective_input,
                                 &hook_output,
                                 false,
+                                &hook_abort_signal,
                             )
                         };
                         if post_hook_result.is_denied() || post_hook_result.is_cancelled() {
@@ -753,6 +857,17 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+fn max_turn_iterations_from_env() -> usize {
+    parse_max_turn_iterations(std::env::var(MAX_TURN_ITERATIONS_ENV_VAR).ok().as_deref())
+}
+
+fn parse_max_turn_iterations(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_TURN_ITERATIONS)
+}
+
 fn context_length_exceeded_error(error: &RuntimeError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("context_length_exceeded")
@@ -911,9 +1026,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        parse_auto_compaction_threshold, parse_max_turn_iterations, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, CancellationToken, ConversationRuntime, RuntimeError,
+        StaticToolExecutor, ToolError, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, DEFAULT_MAX_TURN_ITERATIONS,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -927,6 +1043,110 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cancellation_reaches_an_in_flight_model_request() {
+        struct WaitingApi;
+        impl ApiClient for WaitingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("cancellable entry point should be used");
+            }
+
+            fn stream_cancellable(
+                &mut self,
+                _request: ApiRequest,
+                cancellation: &CancellationToken,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(RuntimeError::cancelled())
+            }
+        }
+
+        let cancellation = CancellationToken::new();
+        let cancel_from_thread = cancellation.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel_from_thread.cancel();
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            WaitingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn_cancellable("wait", None, &cancellation)
+            .expect_err("turn should be cancelled");
+        handle.join().expect("canceller should finish");
+
+        assert!(error.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_reaches_an_in_flight_tool() {
+        struct ToolApi;
+        impl ApiClient for ToolApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "slow-1".to_string(),
+                        name: "slow".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        struct WaitingTool;
+        impl ToolExecutor for WaitingTool {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                panic!("cancellable entry point should be used");
+            }
+
+            fn execute_cancellable(
+                &mut self,
+                _tool_name: &str,
+                _input: &str,
+                cancellation: &CancellationToken,
+            ) -> Result<String, ToolError> {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(ToolError::cancelled())
+            }
+        }
+
+        let cancellation = CancellationToken::new();
+        let cancel_from_thread = cancellation.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel_from_thread.cancel();
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolApi,
+            WaitingTool,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn_cancellable("use the tool", None, &cancellation)
+            .expect_err("tool should be cancelled");
+        handle.join().expect("canceller should finish");
+
+        assert!(error.is_cancelled());
+    }
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -1763,5 +1983,55 @@ mod tests {
             parse_auto_compaction_threshold(Some("0")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    #[test]
+    fn max_turn_iterations_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_max_turn_iterations(None), DEFAULT_MAX_TURN_ITERATIONS);
+        assert_eq!(parse_max_turn_iterations(Some("12")), 12);
+        assert_eq!(
+            parse_max_turn_iterations(Some("not-a-number")),
+            DEFAULT_MAX_TURN_ITERATIONS
+        );
+        assert_eq!(
+            parse_max_turn_iterations(Some("0")),
+            DEFAULT_MAX_TURN_ITERATIONS
+        );
+    }
+
+    #[test]
+    fn stops_runaway_tool_loops_at_the_turn_limit() {
+        struct LoopingApi;
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "again".to_string(),
+                        name: "noop".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("noop", |_| Ok("ok".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(2);
+
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("runaway turn should stop");
+
+        assert!(error.to_string().contains("stopped after 2 model passes"));
+        assert_eq!(runtime.session().messages.len(), 5);
     }
 }

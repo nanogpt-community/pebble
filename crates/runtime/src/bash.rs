@@ -8,11 +8,15 @@ use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 
+use crate::cancellation::{active_cancellation, CancellationToken};
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
+
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+const BASH_TIMEOUT_ENV_VAR: &str = "PEBBLE_BASH_TIMEOUT_MS";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
@@ -112,32 +116,54 @@ async fn execute_bash_async(
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
+    command.kill_on_drop(true);
+    let timeout_ms = input.timeout.unwrap_or_else(default_bash_timeout_ms);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
+    let active_cancellation = active_cancellation();
+    let output_result = tokio::select! {
+        result = timeout(Duration::from_millis(timeout_ms), command.output()) => Some(result),
+        () = wait_for_cancellation(active_cancellation.as_ref()) => None,
+    };
+    let output_result = match output_result {
+        Some(Ok(result)) => (result?, false),
+        Some(Err(_)) => {
+            return Ok(BashCommandOutput {
+                stdout: String::new(),
+                stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
+                raw_output_path: None,
+                interrupted: true,
+                is_image: None,
+                background_task_id: None,
+                backgrounded_by_user: None,
+                assistant_auto_backgrounded: None,
+                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+                return_code_interpretation: Some(String::from("timeout")),
+                no_output_expected: Some(true),
+                structured_content: None,
+                persisted_output_path: None,
+                persisted_output_size: None,
+                sandbox_status: Some(sandbox_status),
+            });
         }
-    } else {
-        (command.output().await?, false)
+        None => {
+            return Ok(BashCommandOutput {
+                stdout: String::new(),
+                stderr: "Command cancelled".to_string(),
+                raw_output_path: None,
+                interrupted: true,
+                is_image: None,
+                background_task_id: None,
+                backgrounded_by_user: None,
+                assistant_auto_backgrounded: None,
+                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+                return_code_interpretation: Some(String::from("cancelled")),
+                no_output_expected: Some(true),
+                structured_content: None,
+                persisted_output_path: None,
+                persisted_output_size: None,
+                sandbox_status: Some(sandbox_status),
+            });
+        }
     };
 
     let (output, interrupted) = output_result;
@@ -169,6 +195,27 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
+    let Some(cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn default_bash_timeout_ms() -> u64 {
+    parse_bash_timeout_ms(std::env::var(BASH_TIMEOUT_ENV_VAR).ok().as_deref())
+}
+
+fn parse_bash_timeout_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -304,7 +351,7 @@ fn shell_command_candidates(command: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::{execute_bash, parse_bash_timeout_ms, BashCommandInput, DEFAULT_BASH_TIMEOUT_MS};
     use crate::sandbox::FilesystemIsolationMode;
 
     #[test]
@@ -343,5 +390,39 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn bash_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_bash_timeout_ms(None), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(parse_bash_timeout_ms(Some("2500")), 2_500);
+        assert_eq!(parse_bash_timeout_ms(Some("0")), DEFAULT_BASH_TIMEOUT_MS);
+        assert_eq!(
+            parse_bash_timeout_ms(Some("not-a-number")),
+            DEFAULT_BASH_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn times_out_foreground_commands() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("sleep 1"),
+            timeout: Some(20),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("timed command should return a result");
+
+        assert!(output.interrupted);
+        assert!(output.stderr.contains("exceeded timeout of 20 ms"));
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("timeout")
+        );
     }
 }

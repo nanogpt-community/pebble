@@ -71,8 +71,17 @@ pub struct ChatCompletionRequest {
     pub billing_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ChatCompletionThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ChatCompletionStreamOptions>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCompletionStreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +328,13 @@ pub struct ChatCompletionContentPart {
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<ChatCompletionImageUrl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCompletionImageUrl {
+    pub url: String,
 }
 
 impl MessageResponse {
@@ -349,7 +365,7 @@ pub enum OutputContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     #[serde(default)]

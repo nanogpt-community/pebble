@@ -1,5 +1,37 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.5.0
+
+- Add Neuralwatt and Lilac as API-key providers using their OpenAI-compatible catalogs and chat-completions APIs.
+- Add Grok subscription access through the official Grok CLI and its OAuth session, without storing or copying xAI subscription tokens in Pebble.
+- Speak xAI's ACP JSON-RPC protocol over the Grok CLI's stdin/stdout transport, keeping prompts out of process arguments and discovering available Grok models from the installed CLI.
+- Render Grok ACP text as it arrives, let `Ctrl+C` cancel a running Grok turn and kill its CLI child, and keep XML tool blocks out of the transcript while streaming.
+- Stream Neuralwatt and Lilac responses natively over OpenAI-compatible SSE, including reasoning, tool calls, usage, and image inputs.
+- Verify API keys during login, cache provider catalogs for instant picker startup, refresh stale catalogs in the background, and surface catalog health in the provider rail.
+- Rebuild model selection around a connected-provider rail, global type-to-search, clearer model details, parallel fault-tolerant catalog loading, and setup guidance for signed-out providers.
+- Make `/provider [name]` select an actual model provider and move NanoGPT-specific upstream overrides to the clearer `/route` command.
+- Show active model authentication readiness in `/status`, including the exact login command when credentials are missing.
+- Show missing model authentication on the first-run banner with the exact login command, without the internal `<platform default>` routing label.
+- Add a real PTY smoke suite for startup, input cancellation, login cancellation, narrow-terminal resizing, Unicode model search, picker cancellation, Grok streaming interrupts, and clean exit; run it in CI.
+- Unify `Ctrl+C` cancellation across HTTP model streams, Grok ACP, MCP calls, hooks, and foreground shell, REPL, PowerShell, and sleep tools, with typed cancellation errors and child-process cleanup.
+- Respect redirected output, `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, and `TERM=dumb`; exercise the compiled terminal on Linux and macOS plus redirected-console behavior on Windows CI.
+- Add `pebble doctor providers [--json]` for credential-safe live auth/catalog probes, model counts, latency, and transport capability reporting without sending inference prompts.
+- Split Grok ACP transport, provider authentication and credential storage, and model-catalog caching into focused modules outside the REPL and picker implementations.
+- Fix the model picker's advertised `q` shortcut so it cancels when the search field is empty instead of inserting `q` into the query.
+- Fix a Unicode byte-boundary panic that could crash the model picker while truncating provider status markers on narrower terminals.
+- Redesign the interactive REPL around a quiet transcript, mode-aware prompt, compact startup identity, readable tool activity, concise help and status views, and consistent command feedback.
+- Keep invalid commands and failed model turns inside the REPL instead of ending the process.
+- Hide raw model reasoning from the transcript while retaining it in session state and traces.
+- Persist REPL history across launches without saving inline login credentials.
+- Make `Ctrl+C` cancel the current input and reserve `Ctrl+D`, `/exit`, and `/quit` for leaving the REPL.
+- Stop runaway agent turns after 32 model passes by default, with an environment override for longer tasks.
+- Add default timeouts for model API requests and foreground shell, REPL, and PowerShell tools so a missing timeout cannot hang Pebble forever.
+- Roll back failed requests that never produced an assistant response, while preserving partial tool turns and their undo snapshots.
+- Stop injecting legacy `summary-*.md` conversation dumps as global project memory, and give durable memory files a separate 5,000-character prompt budget.
+- Reject unknown CLI options instead of accidentally sending them to the model as a paid prompt, and exit cleanly when piped output closes early.
+- Build agent context with the real local date instead of the old hardcoded March 2026 value.
+- Treat an explicit search path of `.` as a normal workspace-wide search, keeping `.gitignore`, hidden-directory, build-output, and Pebble-state exclusions enabled.
+
 ## v0.4.7
 
 - Add structured turn tracing with redacted API call, tool call, permission, compaction, usage, and context-window metadata, plus trace/replay commands with text and JSON output.

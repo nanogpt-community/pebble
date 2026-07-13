@@ -4,7 +4,7 @@ use super::{
     format_web_tools_status, load_custom_slash_commands, load_turn_trace, login_model_guidance,
     normalize_generated_pebble_md, parse_args, parse_auth_command, parse_checksum_for_asset,
     parse_logout_command, parse_mcp_command, parse_model_command, parse_permissions_command,
-    parse_provider_command, parse_proxy_command, persist_runtime_defaults,
+    parse_provider_command, parse_proxy_command, parse_route_command, persist_runtime_defaults,
     remove_saved_credentials, render_archived_tool_results_report, render_config_check_report,
     render_custom_command_template, render_export_text, render_gc_report,
     render_permission_diff_preview, render_replay_report, render_session_timeline,
@@ -94,6 +94,14 @@ fn defaults_to_repl_when_no_args() {
             }
         );
     });
+}
+
+#[test]
+fn rejects_unknown_options_instead_of_sending_them_to_the_model() {
+    let error = parse_args(&["--modle".to_string(), "glm-5.1".to_string()])
+        .expect_err("unknown option should fail before starting a prompt");
+
+    assert_eq!(error, "unknown option: --modle");
 }
 
 #[test]
@@ -814,7 +822,7 @@ fn web_tools_status_mentions_auth_and_tool_availability() {
 }
 
 #[test]
-fn status_report_includes_web_tools_section() {
+fn status_report_includes_runtime_health() {
     let report = format_status_report(
         ApiService::NanoGpt,
         DEFAULT_MODEL,
@@ -858,7 +866,9 @@ fn status_report_includes_web_tools_section() {
             web_tools_summary: "web".to_string(),
         },
     );
-    assert!(report.contains("Web Tools"));
+    assert!(report.contains("Runtime"));
+    assert!(report.contains("model auth"));
+    assert!(report.contains("web disabled"));
 }
 
 #[test]
@@ -1463,11 +1473,19 @@ fn parses_model_subcommand() {
 #[test]
 fn parses_provider_subcommand() {
     with_isolated_config_home(|| {
-        let args = vec!["provider".to_string(), "openrouter".to_string()];
+        let args = vec!["provider".to_string(), "lilac".to_string()];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Provider {
-                provider: Some("openrouter".to_string()),
+                provider: Some("lilac".to_string()),
+            }
+        );
+
+        let args = vec!["route".to_string(), "openrouter".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("route args should parse"),
+            CliAction::Route {
+                route: Some("openrouter".to_string()),
             }
         );
     });
@@ -1612,6 +1630,23 @@ fn parses_doctor_bundle_subcommand() {
                 .expect("doctor bundle should parse"),
             CliAction::Doctor {
                 command: DoctorCommand::Bundle,
+            }
+        );
+    });
+}
+
+#[test]
+fn parses_provider_diagnostics_json_subcommand() {
+    with_isolated_config_home(|| {
+        assert_eq!(
+            parse_args(&[
+                "doctor".to_string(),
+                "providers".to_string(),
+                "--json".to_string(),
+            ])
+            .expect("provider diagnostics should parse"),
+            CliAction::Doctor {
+                command: DoctorCommand::Providers { json: true },
             }
         );
     });
@@ -1891,6 +1926,27 @@ fn parses_auth_slash_command() {
         })
     );
     assert_eq!(
+        parse_auth_command("/login neuralwatt nw-key"),
+        Some(LoginCommand {
+            service: Some(AuthService::Neuralwatt),
+            api_key: Some("nw-key".to_string()),
+        })
+    );
+    assert_eq!(
+        parse_auth_command("/login lilac lilac-key"),
+        Some(LoginCommand {
+            service: Some(AuthService::Lilac),
+            api_key: Some("lilac-key".to_string()),
+        })
+    );
+    assert_eq!(
+        parse_auth_command("/login grok"),
+        Some(LoginCommand {
+            service: Some(AuthService::Grok),
+            api_key: None,
+        })
+    );
+    assert_eq!(
         parse_auth_command("/login openai-codex"),
         Some(LoginCommand {
             service: Some(AuthService::OpenAiCodex),
@@ -2007,10 +2063,16 @@ fn resolves_known_pebble_model_aliases() {
 fn parses_provider_slash_command() {
     assert_eq!(parse_provider_command("/provider"), Some(None));
     assert_eq!(
-        parse_provider_command("/providers openrouter"),
-        Some(Some("openrouter".to_string()))
+        parse_provider_command("/providers lilac"),
+        Some(Some("lilac".to_string()))
     );
     assert_eq!(parse_provider_command("/status"), None);
+
+    assert_eq!(parse_route_command("/route"), Some(None));
+    assert_eq!(
+        parse_route_command("/routing openrouter"),
+        Some(Some("openrouter".to_string()))
+    );
 }
 
 #[test]
@@ -2828,7 +2890,7 @@ fn streamed_tool_call_start_renders_after_accumulation() {
     // (see `ui::tool_call_header`). Strip ANSI for deterministic
     // substring checks and assert on the stable human-visible parts.
     let plain = strip_ansi_for_test(&text);
-    assert!(plain.contains("read_file"));
+    assert!(plain.contains("Read"));
     assert!(plain.contains("README.md"));
     assert!(!plain.contains("{}"));
 }

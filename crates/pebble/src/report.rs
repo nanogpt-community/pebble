@@ -1,4 +1,6 @@
-use crossterm::style::{Color, Stylize};
+use crossterm::style::Color;
+
+use crate::ui::Stylize;
 
 pub(crate) fn report_title(text: &str) -> String {
     format!("{}", text.bold().with(Color::Yellow))

@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use api::{
     ApiError, ApiService, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
@@ -11,9 +12,11 @@ use api::{
     StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
+use crossterm::terminal::size as terminal_size;
 use serde_json::Value as JsonValue;
 
 use crate::app::{AllowedToolSet, CollaborationMode, FastMode};
+use crate::grok_acp;
 use crate::mcp::{call_mcp_tool, McpCatalog};
 use crate::proxy::{
     convert_messages_for_proxy, parse_proxy_response, ProxyMessage, ProxySegment, RuntimeToolSpec,
@@ -24,9 +27,10 @@ use crate::session_store::summarize_tool_payload;
 use crate::tool_render::render_tool_result_block;
 use crate::ui;
 use runtime::{
-    get_compact_continuation_message, get_tool_result_context_output, ApiClient, ApiRequest,
-    AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode,
-    PermissionPolicy, RuntimeError, TokenUsage, ToolError, ToolExecutor,
+    get_compact_continuation_message, get_tool_result_context_output, set_active_cancellation,
+    ApiClient, ApiRequest, AssistantEvent, CancellationToken, ContentBlock, ConversationMessage,
+    MessageRole, PermissionMode, PermissionPolicy, RuntimeError, TokenUsage, ToolError,
+    ToolExecutor,
 };
 use tools::{set_active_backend_service, GlobalToolRegistry};
 
@@ -34,6 +38,22 @@ const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const FILE_REF_MAX_BYTES: u64 = 200_000;
 const DIRECTORY_REF_MAX_ENTRIES: usize = 200;
 const IMAGE_REF_PREFIX: &str = "@";
+
+async fn await_api_or_cancel<T>(
+    future: impl std::future::Future<Output = Result<T, ApiError>>,
+    cancellation: &CancellationToken,
+) -> Result<T, RuntimeError> {
+    tokio::select! {
+        result = future => result.map_err(|error| RuntimeError::new(error.to_string())),
+        () = wait_for_cancellation(cancellation) => Err(RuntimeError::cancelled()),
+    }
+}
+
+async fn wait_for_cancellation(cancellation: &CancellationToken) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
 
 pub(crate) struct PebbleRuntimeClient {
     runtime: tokio::runtime::Runtime,
@@ -83,8 +103,19 @@ impl PebbleRuntimeClient {
 
 impl ApiClient for PebbleRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_cancellable(request, &CancellationToken::new())
+    }
+
+    fn stream_cancellable(
+        &mut self,
+        request: ApiRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if self.service == ApiService::Grok {
+            return self.stream_via_grok_cli(request, cancellation);
+        }
         if self.proxy_tool_calls {
-            return self.stream_via_proxy(request);
+            return self.stream_via_proxy(request, cancellation);
         }
 
         let effective_reasoning_effort =
@@ -115,10 +146,11 @@ impl ApiClient for PebbleRuntimeClient {
 
         let client = self.service_client()?;
         self.runtime.block_on(async {
-            let mut stream = client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stream = await_api_or_cancel(
+                client.stream_message(&message_request),
+                cancellation,
+            )
+            .await?;
             let mut output: Box<dyn Write> = if self.render_output {
                 Box::new(io::stdout())
             } else {
@@ -130,19 +162,18 @@ impl ApiClient for PebbleRuntimeClient {
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
             let mut stream_fallback_requested = false;
-            // Track whether we've already printed the "thinking" lead so we
-            // don't repeat it for each streamed thinking delta. The flag is
-            // reset every time the outer loop re-enters this closure.
-            let mut thinking_stream_started = false;
             // Print the "● pebble" assistant lead exactly once per streamed
             // response — right before the first text delta — so the model's
             // reply is visually anchored even after a wall of tool output.
             let mut assistant_lead_emitted = false;
-            let thinking_enabled = effective_reasoning_effort.is_some();
             let render_output_enabled = self.render_output;
 
             loop {
-                let event = match stream.next_event().await {
+                let next_event = tokio::select! {
+                    result = stream.next_event() => result,
+                    () = wait_for_cancellation(cancellation) => return Err(RuntimeError::cancelled()),
+                };
+                let event = match next_event {
                     Ok(Some(event)) => event,
                     Ok(None) => break,
                     Err(ApiError::StreamApi {
@@ -189,13 +220,13 @@ impl ApiClient for PebbleRuntimeClient {
                             if !text.is_empty() {
                                 if render_output_enabled && !assistant_lead_emitted {
                                     write!(output, "{}", ui::assistant_lead())
-                                        .and_then(|_| output.flush())
+                                        .and_then(|()| output.flush())
                                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                                     assistant_lead_emitted = true;
                                 }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     write!(output, "{rendered}")
-                                        .and_then(|_| output.flush())
+                                        .and_then(|()| output.flush())
                                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 }
                                 events.push(AssistantEvent::TextDelta(text));
@@ -203,23 +234,10 @@ impl ApiClient for PebbleRuntimeClient {
                         }
                         ContentBlockDelta::ThinkingDelta { thinking } => {
                             if !thinking.is_empty() {
-                                // Surface reasoning live when the user has
-                                // opted in via `/thinking on`. We dim the
-                                // text heavily so it reads as subordinate
-                                // context rather than primary output.
-                                if thinking_enabled && render_output_enabled {
-                                    if !thinking_stream_started {
-                                        write!(output, "{}", ui::thinking_lead())
-                                            .and_then(|_| output.flush())
-                                            .map_err(|error| {
-                                                RuntimeError::new(error.to_string())
-                                            })?;
-                                        thinking_stream_started = true;
-                                    }
-                                    write!(output, "{}", ui::thinking_chunk(&thinking))
-                                        .and_then(|_| output.flush())
-                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                                }
+                                // Keep model reasoning in the trace and
+                                // conversation state without dumping it into
+                                // the transcript. `/reasoning` controls model
+                                // effort, not visibility.
                                 events.push(AssistantEvent::ThinkingDelta(thinking));
                             }
                         }
@@ -237,17 +255,8 @@ impl ApiClient for PebbleRuntimeClient {
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(output, "{rendered}")
-                                .and_then(|_| output.flush())
+                                .and_then(|()| output.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        }
-                        // If we were streaming a reasoning block, close it
-                        // with a blank line so the subsequent assistant text
-                        // visually separates from the thinking trail.
-                        if thinking_stream_started {
-                            writeln!(output)
-                                .and_then(|_| output.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            thinking_stream_started = false;
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
                             render_streamed_tool_call_start(output.as_mut(), &name, &input)?;
@@ -266,7 +275,7 @@ impl ApiClient for PebbleRuntimeClient {
                         saw_stop = true;
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(output, "{rendered}")
-                                .and_then(|_| output.flush())
+                                .and_then(|()| output.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
                         events.push(AssistantEvent::MessageStop);
@@ -293,13 +302,14 @@ impl ApiClient for PebbleRuntimeClient {
                 return Ok(events);
             }
 
-            let response = client
-                .send_message(&MessageRequest {
+            let response = await_api_or_cancel(
+                client.send_message(&MessageRequest {
                     stream: false,
                     ..message_request.clone()
-                })
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }),
+                cancellation,
+            )
+            .await?;
             response_to_events(response, output.as_mut())
         })
     }
@@ -315,9 +325,63 @@ impl PebbleRuntimeClient {
         Ok(client)
     }
 
+    fn stream_via_grok_cli(
+        &mut self,
+        request: ApiRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let messages = convert_messages_for_proxy(&request.messages).map_err(RuntimeError::new)?;
+        let prompt = render_grok_cli_prompt(&messages);
+        let mut system = request.system_prompt.join("\n\n");
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&crate::proxy::build_proxy_system_prompt(&self.tool_specs));
+
+        let cancelled = cancellation.atomic_flag();
+        let mut output: Box<dyn Write> = if self.render_output {
+            Box::new(io::stdout())
+        } else {
+            Box::new(io::sink())
+        };
+        let first_pass = run_grok_proxy_pass(
+            &self.model,
+            &prompt,
+            &system,
+            cancelled.as_ref(),
+            &self.tool_specs,
+            output.as_mut(),
+            true,
+        )?;
+
+        let mut events = if should_retry_proxy_tool_prompt(&first_pass.events) {
+            let retry_prompt = format!("{prompt}\n\n[user]\n{}", proxy_retry_reminder());
+            run_grok_proxy_pass(
+                &self.model,
+                &retry_prompt,
+                &system,
+                cancelled.as_ref(),
+                &self.tool_specs,
+                output.as_mut(),
+                false,
+            )?
+            .events
+        } else {
+            output
+                .write_all(&first_pass.deferred_render)
+                .and_then(|()| output.flush())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            first_pass.events
+        };
+        events.push(AssistantEvent::Usage(TokenUsage::default()));
+        events.push(AssistantEvent::MessageStop);
+        Ok(events)
+    }
+
     fn stream_via_proxy(
         &mut self,
         request: ApiRequest,
+        cancellation: &CancellationToken,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let effective_reasoning_effort =
             effective_reasoning_effort(self.collaboration_mode, self.reasoning_effort);
@@ -341,10 +405,9 @@ impl PebbleRuntimeClient {
 
         let client = self.service_client()?;
         self.runtime.block_on(async {
-            let response = client
-                .send_message(&base_message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let response =
+                await_api_or_cancel(client.send_message(&base_message_request), cancellation)
+                    .await?;
             let mut first_render = Vec::new();
             let first_events =
                 proxy_response_to_events(response, &mut first_render, &self.tool_specs)?;
@@ -355,10 +418,8 @@ impl PebbleRuntimeClient {
                     messages,
                     ..base_message_request
                 };
-                let retry_response = client
-                    .send_message(&retry_request)
-                    .await
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let retry_response =
+                    await_api_or_cancel(client.send_message(&retry_request), cancellation).await?;
                 let mut output: Box<dyn Write> = if self.render_output {
                     Box::new(io::stdout())
                 } else {
@@ -374,10 +435,232 @@ impl PebbleRuntimeClient {
             };
             output
                 .write_all(&first_render)
-                .and_then(|_| output.flush())
+                .and_then(|()| output.flush())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             Ok(first_events)
         })
+    }
+}
+
+fn render_grok_cli_prompt(messages: &[ProxyMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| format!("[{}]\n{}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokChunkMode {
+    Undecided,
+    Text,
+    Buffered,
+}
+
+#[derive(Debug, Default)]
+struct GrokChunkGate {
+    pending: String,
+    mode: Option<GrokChunkMode>,
+    emitted_text: bool,
+}
+
+impl GrokChunkGate {
+    fn push(&mut self, chunk: &str) -> Option<String> {
+        self.pending.push_str(chunk);
+        let mode = self.mode.unwrap_or(GrokChunkMode::Undecided);
+        match mode {
+            GrokChunkMode::Buffered => None,
+            GrokChunkMode::Text => self.emit_safe_prefix(),
+            GrokChunkMode::Undecided => {
+                let trimmed = self.pending.trim_start();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if trimmed.starts_with('<') {
+                    self.mode = Some(GrokChunkMode::Buffered);
+                    return None;
+                }
+                let normalized = trimmed.to_ascii_lowercase();
+                const NARRATION_PREFIXES: [&str; 6] = [
+                    "let me ",
+                    "i'll ",
+                    "i will ",
+                    "first, i'll",
+                    "first i ",
+                    "let's ",
+                ];
+                let may_be_narration = NARRATION_PREFIXES.iter().any(|prefix| {
+                    prefix.starts_with(&normalized) || normalized.starts_with(prefix)
+                });
+                if may_be_narration {
+                    if self.pending.contains('\n') {
+                        self.mode = Some(GrokChunkMode::Buffered);
+                    }
+                    return None;
+                }
+                self.mode = Some(GrokChunkMode::Text);
+                self.emit_safe_prefix()
+            }
+        }
+    }
+
+    fn emit_safe_prefix(&mut self) -> Option<String> {
+        if let Some(marker) = self.pending.find('<') {
+            self.mode = Some(GrokChunkMode::Buffered);
+            let text = self.pending[..marker].to_string();
+            self.pending.clear();
+            if !text.is_empty() {
+                self.emitted_text = true;
+                return Some(text);
+            }
+            return None;
+        }
+        const HELD_CHARS: usize = 16;
+        let char_count = self.pending.chars().count();
+        if char_count <= HELD_CHARS {
+            return None;
+        }
+        let split = self
+            .pending
+            .char_indices()
+            .nth(char_count - HELD_CHARS)
+            .map_or(0, |(index, _)| index);
+        let tail = self.pending.split_off(split);
+        let text = std::mem::replace(&mut self.pending, tail);
+        if text.is_empty() {
+            None
+        } else {
+            self.emitted_text = true;
+            Some(text)
+        }
+    }
+
+    fn finish_text(&mut self) -> Option<String> {
+        if self.mode == Some(GrokChunkMode::Text)
+            && !self.pending.contains('<')
+            && !self.pending.is_empty()
+        {
+            self.emitted_text = true;
+            return Some(std::mem::take(&mut self.pending));
+        }
+        None
+    }
+
+    fn streamed_text(&self) -> bool {
+        self.emitted_text
+    }
+}
+
+fn run_grok_proxy_pass(
+    model: &str,
+    prompt: &str,
+    system: &str,
+    cancelled: &AtomicBool,
+    tool_specs: &[RuntimeToolSpec],
+    output: &mut (impl Write + ?Sized),
+    defer_buffered_output: bool,
+) -> Result<GrokPass, RuntimeError> {
+    let mut gate = GrokChunkGate::default();
+    let mut events = Vec::new();
+    let mut assistant_lead_emitted = false;
+    let full_text = grok_acp::run(model, prompt, system, cancelled, |chunk| {
+        if let Some(text) = gate.push(chunk) {
+            render_grok_text_chunk(output, &text, &mut assistant_lead_emitted)?;
+            events.push(AssistantEvent::TextDelta(text));
+        }
+        Ok(())
+    })?;
+    if let Some(text) = gate.finish_text() {
+        render_grok_text_chunk(output, &text, &mut assistant_lead_emitted)?;
+        events.push(AssistantEvent::TextDelta(text));
+    }
+    if gate.streamed_text() {
+        for segment in parse_proxy_response(&full_text, tool_specs).map_err(RuntimeError::new)? {
+            if let ProxySegment::ToolUse { id, name, input } = segment {
+                events.push(AssistantEvent::ToolUse { id, name, input });
+            }
+        }
+    } else {
+        let mut deferred_render = Vec::new();
+        if defer_buffered_output {
+            append_proxy_text_events(&full_text, &mut deferred_render, &mut events, tool_specs)?;
+        } else {
+            append_proxy_text_events(&full_text, output, &mut events, tool_specs)?;
+        }
+        return Ok(GrokPass {
+            events,
+            deferred_render,
+        });
+    }
+    Ok(GrokPass {
+        events,
+        deferred_render: Vec::new(),
+    })
+}
+
+struct GrokPass {
+    events: Vec<AssistantEvent>,
+    deferred_render: Vec<u8>,
+}
+
+fn render_grok_text_chunk(
+    output: &mut (impl Write + ?Sized),
+    text: &str,
+    assistant_lead_emitted: &mut bool,
+) -> Result<(), RuntimeError> {
+    if !*assistant_lead_emitted {
+        write!(output, "{}", ui::assistant_lead())
+            .and_then(|()| output.flush())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        *assistant_lead_emitted = true;
+    }
+    write!(output, "{text}")
+        .and_then(|()| output.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+#[cfg(test)]
+mod grok_stream_tests {
+    use super::{render_grok_cli_prompt, GrokChunkGate, ProxyMessage};
+
+    #[test]
+    fn renders_role_delimited_grok_prompt() {
+        let prompt = render_grok_cli_prompt(&[
+            ProxyMessage {
+                role: "user".to_string(),
+                content: "inspect this".to_string(),
+            },
+            ProxyMessage {
+                role: "assistant".to_string(),
+                content: "working".to_string(),
+            },
+        ]);
+        assert_eq!(prompt, "[user]\ninspect this\n\n[assistant]\nworking");
+    }
+
+    #[test]
+    fn streams_plain_text_but_never_proxy_markup() {
+        let mut text = GrokChunkGate::default();
+        let mut visible = String::new();
+        for chunk in ["This is a long enough ", "answer to stream safely."] {
+            if let Some(chunk) = text.push(chunk) {
+                visible.push_str(&chunk);
+            }
+        }
+        visible.push_str(&text.finish_text().unwrap_or_default());
+        assert_eq!(visible, "This is a long enough answer to stream safely.");
+
+        let mut tool = GrokChunkGate::default();
+        assert_eq!(tool.push("<tool_"), None);
+        assert_eq!(tool.push("call name=\"read_file\">"), None);
+        assert_eq!(tool.finish_text(), None);
+
+        let mut mixed = GrokChunkGate::default();
+        assert!(mixed
+            .push("A visible answer that is already long enough to emit ")
+            .is_some());
+        assert!(mixed.push("<tool_call name=\"read_file\">").is_some());
+        assert!(mixed.streamed_text());
     }
 }
 
@@ -443,7 +726,7 @@ pub(crate) fn push_output_block(
             if !text.is_empty() {
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
                 write!(out, "{rendered}")
-                    .and_then(|_| out.flush())
+                    .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
             }
@@ -452,7 +735,6 @@ pub(crate) fn push_output_block(
             thinking,
             signature,
         } => {
-            render_thinking_block_summary(&thinking, out)?;
             if !thinking.is_empty() {
                 events.push(AssistantEvent::ThinkingDelta(thinking));
             }
@@ -464,7 +746,7 @@ pub(crate) fn push_output_block(
         OutputContentBlock::ToolUse { id, name, input } => {
             let initial_input = if streaming_tool_input
                 && input.is_object()
-                && input.as_object().is_some_and(|object| object.is_empty())
+                && input.as_object().is_some_and(serde_json::Map::is_empty)
             {
                 String::new()
             } else {
@@ -482,7 +764,7 @@ pub(crate) fn render_streamed_tool_call_start(
     input: &str,
 ) -> Result<(), RuntimeError> {
     writeln!(out, "{}", format_tool_call_start(name, input))
-        .and_then(|_| out.flush())
+        .and_then(|()| out.flush())
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
@@ -510,8 +792,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             let lines = parsed
                 .get("content")
                 .and_then(JsonValue::as_str)
-                .map(|content| content.lines().count())
-                .unwrap_or(0);
+                .map_or(0, |content| content.lines().count());
             format!("{path} ({lines} lines)")
         }
         "edit_file" | "Edit" => parsed
@@ -528,8 +809,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             let patch_lines = parsed
                 .get("patch")
                 .and_then(JsonValue::as_str)
-                .map(|patch| patch.lines().count())
-                .unwrap_or(0);
+                .map_or(0, |patch| patch.lines().count());
             let mode = if dry_run { "check" } else { "apply" };
             format!("{mode} ({patch_lines} lines)")
         }
@@ -546,20 +826,11 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         _ => summarize_tool_payload(input),
     };
 
-    ui::tool_call_header(name, &detail)
-}
-
-fn render_thinking_block_summary(
-    _text: &str,
-    _out: &mut (impl Write + ?Sized),
-) -> Result<(), RuntimeError> {
-    // Intentionally silent. Historically this printed a "reasoning hidden
-    // (N chars)" note, but we already surface reasoning live via
-    // `ui::thinking_chunk` when the user opts in to `/thinking on`, and
-    // showing a stand-in summary otherwise is just noise — especially when
-    // the same turn contains multiple thinking blocks, which caused the
-    // note to repeat on every tool hop.
-    Ok(())
+    let detail_width = terminal_size()
+        .ok()
+        .map_or(80, |(columns, _)| usize::from(columns).saturating_sub(18))
+        .max(12);
+    ui::tool_call_header(name, &truncate_for_summary(&detail, detail_width))
 }
 
 pub(crate) fn response_to_events(
@@ -568,8 +839,17 @@ pub(crate) fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut assistant_lead_emitted = false;
 
     for block in response.content {
+        if matches!(&block, OutputContentBlock::Text { text } if !text.is_empty())
+            && !assistant_lead_emitted
+        {
+            write!(out, "{}", ui::assistant_lead())
+                .and_then(|()| out.flush())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            assistant_lead_emitted = true;
+        }
         push_output_block(block, out, &mut events, &mut pending_tool, false)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
@@ -601,7 +881,6 @@ pub(crate) fn proxy_response_to_events(
                 thinking,
                 signature,
             } => {
-                render_thinking_block_summary(&thinking, out)?;
                 if !thinking.is_empty() {
                     events.push(AssistantEvent::ThinkingDelta(thinking));
                 }
@@ -640,12 +919,19 @@ pub(crate) fn append_proxy_text_events(
     let has_tool_use = segments
         .iter()
         .any(|segment| matches!(segment, ProxySegment::ToolUse { .. }));
+    let mut assistant_lead_emitted = false;
     for segment in segments {
         match segment {
             ProxySegment::Text(text) => {
                 if !text.is_empty() && should_render_proxy_text_segment(&text, has_tool_use) {
+                    if !assistant_lead_emitted {
+                        write!(out, "{}", ui::assistant_lead())
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        assistant_lead_emitted = true;
+                    }
                     write!(out, "{text}")
-                        .and_then(|_| out.flush())
+                        .and_then(|()| out.flush())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     events.push(AssistantEvent::TextDelta(text));
                 }
@@ -757,6 +1043,18 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_cancellable(tool_name, input, &CancellationToken::new())
+    }
+
+    fn execute_cancellable(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
         if self
             .allowed_tools
             .as_ref()
@@ -768,23 +1066,60 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = parse_tool_input_value(tool_name, input, &self.tool_specs)?;
         let _service_guard = set_active_backend_service(self.service);
+        let _cancellation_guard = set_active_cancellation(cancellation.clone());
         let output = if let Some(tool) = self.mcp_catalog.find_tool(tool_name) {
-            call_mcp_tool(tool, &value).map_err(|error| ToolError::new(error.to_string()))
+            call_mcp_tool(tool, &value, cancellation)
+                .map_err(|error| ToolError::new(error.to_string()))
         } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
-        }?;
+            execute_registry_tool_cancellable(
+                self.tool_registry.clone(),
+                tool_name.to_string(),
+                value,
+                cancellation.clone(),
+            )
+        };
+        if cancellation.is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
+        let output = output?;
         if self.emit_output {
             let block = render_tool_result_block(tool_name, &output);
             if !block.is_empty() {
                 let mut stdout = io::stdout();
                 write!(stdout, "{block}")
-                    .and_then(|_| stdout.flush())
+                    .and_then(|()| stdout.flush())
                     .map_err(|error| ToolError::new(error.to_string()))?;
             }
         }
         Ok(output)
+    }
+}
+
+fn execute_registry_tool_cancellable(
+    registry: GlobalToolRegistry,
+    tool_name: String,
+    input: JsonValue,
+    cancellation: CancellationToken,
+) -> Result<String, ToolError> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let tool_cancellation = cancellation.clone();
+    std::thread::spawn(move || {
+        let _cancellation_guard = set_active_cancellation(tool_cancellation);
+        let result = registry.execute(&tool_name, &input).map_err(ToolError::new);
+        let _ = sender.send(result);
+    });
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::cancelled());
+        }
+        match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ToolError::new("tool worker stopped without a result"));
+            }
+        }
     }
 }
 
@@ -918,7 +1253,7 @@ pub(crate) fn convert_messages(
                                 name: name.clone(),
                                 input: serde_json::from_str(input)
                                     .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                            })
+                            });
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,

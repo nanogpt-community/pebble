@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::cancellation::CancellationToken;
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
@@ -66,6 +67,17 @@ impl HookAbortSignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub(crate) fn from_cancellation(cancellation: &CancellationToken) -> Self {
+        Self {
+            aborted: cancellation.cancelled.clone(),
+        }
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        CancellationToken::from_atomic_flag(self.aborted.clone())
     }
 
     pub fn abort(&self) {

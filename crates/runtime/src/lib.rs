@@ -1,5 +1,6 @@
 mod bash;
 mod bootstrap;
+mod cancellation;
 mod compact;
 mod config;
 mod conversation;
@@ -20,6 +21,9 @@ mod usage;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
+pub use cancellation::{
+    active_cancellation, set_active_cancellation, ActiveCancellationGuard, CancellationToken,
+};
 pub use compact::{
     build_compaction_prompt, compact_session, compact_session_with_summary,
     estimate_session_tokens, format_compact_summary, get_compact_continuation_message,

@@ -130,12 +130,11 @@ pub fn parse_proxy_response(
         if start > cursor {
             segments.push(ProxySegment::Text(text[cursor..start].to_string()));
         }
-        let open_end = match find_tag_end(text, start) {
-            Ok(open_end) => open_end,
-            Err(_) => {
-                segments.push(ProxySegment::Text(text[start..].to_string()));
-                return Ok(segments);
-            }
+        let open_end = if let Ok(open_end) = find_tag_end(text, start) {
+            open_end
+        } else {
+            segments.push(ProxySegment::Text(text[start..].to_string()));
+            return Ok(segments);
         };
         let Some((block, consumed_end)) =
             recover_proxy_block(text, start, open_end, &block_kind, tool_specs)
@@ -181,10 +180,7 @@ fn find_next_proxy_block(
     }
     for tool_spec in tool_specs {
         if let Some(start) = find_tag_start(text, cursor, &tool_spec.name) {
-            let candidate = (
-                start,
-                ProxyBlockKind::DirectTool(tool_spec.name.to_string()),
-            );
+            let candidate = (start, ProxyBlockKind::DirectTool(tool_spec.name.clone()));
             match &best {
                 Some((best_start, _)) if *best_start <= start => {}
                 _ => best = Some(candidate),
@@ -578,7 +574,7 @@ fn coerce_proxy_arg_value(
             .parse::<bool>()
             .map(Value::Bool)
             .map_err(|error| format!("invalid boolean for {name}: {error}")),
-        Some("json") | Some("object") | Some("array") => {
+        Some("json" | "object" | "array") => {
             serde_json::from_str(raw).map_err(|error| format!("invalid JSON for {name}: {error}"))
         }
         _ => Ok(Value::String(raw.to_string())),

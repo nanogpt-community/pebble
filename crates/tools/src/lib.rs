@@ -15,7 +15,7 @@ use platform::{pebble_config_home, write_atomic};
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
-    apply_patch, edit_file, execute_bash, get_compact_continuation_message,
+    active_cancellation, apply_patch, edit_file, execute_bash, get_compact_continuation_message,
     get_tool_result_context_output, glob_search, grep_search, load_system_prompt_with_model_family,
     read_file, write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
     ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
@@ -24,6 +24,9 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+const TOOL_TIMEOUT_ENV_VAR: &str = "PEBBLE_TOOL_TIMEOUT_MS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
@@ -377,7 +380,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace. The optional timeout is in milliseconds.",
+            description: "Execute a shell command in the current workspace. Timeout is in milliseconds and defaults to 600000.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -717,7 +720,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "REPL",
-            description: "Execute code in a REPL-like subprocess.",
+            description: "Execute code in a REPL-like subprocess. Timeout is in milliseconds and defaults to 600000.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -732,7 +735,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command. The optional timeout is in milliseconds.",
+            description: "Execute a PowerShell command. Timeout is in milliseconds and defaults to 600000.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -861,7 +864,7 @@ fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
 }
 
 fn run_sleep(input: SleepInput) -> Result<String, String> {
-    to_pretty_json(execute_sleep(input))
+    to_pretty_json(execute_sleep(input)?)
 }
 
 fn run_brief(input: BriefInput) -> Result<String, String> {
@@ -2816,12 +2819,23 @@ fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_sleep(input: SleepInput) -> SleepOutput {
-    std::thread::sleep(Duration::from_millis(input.duration_ms));
-    SleepOutput {
+fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
+    let started = Instant::now();
+    let duration = Duration::from_millis(input.duration_ms);
+    while started.elapsed() < duration {
+        if active_cancellation().is_some_and(|token| token.is_cancelled()) {
+            return Err("request cancelled".to_string());
+        }
+        std::thread::sleep(
+            duration
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(20)),
+        );
+    }
+    Ok(SleepOutput {
         duration_ms: input.duration_ms,
         message: format!("Slept for {}ms", input.duration_ms),
-    }
+    })
 }
 
 fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
@@ -2925,11 +2939,12 @@ fn execute_structured_output(input: StructuredOutputInput) -> StructuredOutputRe
     }
 }
 
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+fn execute_repl(mut input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
     let runtime = resolve_repl_runtime(&input.language)?;
+    input.timeout_ms.get_or_insert_with(default_tool_timeout_ms);
     let started = Instant::now();
     let mut process = Command::new(runtime.program);
     process
@@ -2941,6 +2956,11 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if let Some(timeout_ms) = input.timeout_ms {
         let mut child = process.spawn().map_err(|error| error.to_string())?;
         loop {
+            if active_cancellation().is_some_and(|token| token.is_cancelled()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("request cancelled".to_string());
+            }
             if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                 let output = child
                     .wait_with_output()
@@ -3270,7 +3290,7 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     execute_shell_command(
         shell,
         &input.command,
-        input.timeout,
+        Some(input.timeout.unwrap_or_else(default_tool_timeout_ms)),
         input.run_in_background,
     )
 }
@@ -3294,6 +3314,17 @@ fn command_exists(command: &str) -> bool {
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn default_tool_timeout_ms() -> u64 {
+    parse_tool_timeout_ms(std::env::var(TOOL_TIMEOUT_ENV_VAR).ok().as_deref())
+}
+
+fn parse_tool_timeout_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3346,6 +3377,14 @@ fn execute_shell_command(
         let mut child = process.spawn()?;
         let started = Instant::now();
         loop {
+            if active_cancellation().is_some_and(|token| token.is_cancelled()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "request cancelled",
+                ));
+            }
             if let Some(status) = child.try_wait()? {
                 let output = child.wait_with_output()?;
                 return Ok(runtime::BashCommandOutput {
@@ -3495,7 +3534,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{execute_tool, mvp_tool_specs};
+    use super::{execute_tool, mvp_tool_specs, parse_tool_timeout_ms, DEFAULT_TOOL_TIMEOUT_MS};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3509,6 +3548,17 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    #[test]
+    fn tool_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(parse_tool_timeout_ms(None), DEFAULT_TOOL_TIMEOUT_MS);
+        assert_eq!(parse_tool_timeout_ms(Some("2500")), 2_500);
+        assert_eq!(parse_tool_timeout_ms(Some("0")), DEFAULT_TOOL_TIMEOUT_MS);
+        assert_eq!(
+            parse_tool_timeout_ms(Some("not-a-number")),
+            DEFAULT_TOOL_TIMEOUT_MS
+        );
     }
 
     #[test]
